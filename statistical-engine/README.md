@@ -1,5 +1,402 @@
-# Statistical Engine
+# Statistical Index Engine & Validation Module
 
-Owner: Samarth
+**Module Owner:** Samarth
+**Project:** SIH26056 — Real-Time Airfare Price Index for India
+**Directory:** `statistical-engine/`
+**Status:** Complete, Tested, Self-Contained, and Documented
 
-Price relatives, Jevons/short-index calculation, route/lead-time indices, weighted national aggregation, contributions and 30-day validation.
+---
+
+## Table of Contents
+
+1. [Module Purpose & Responsibility](#1-module-purpose--responsibility)
+2. [Contract Boundary & Status](#2-contract-boundary--status)
+3. [Architecture & Module Organization](#3-architecture--module-organization)
+4. [Input Contract (Expected Clean Observations)](#4-input-contract-expected-clean-observations)
+5. [Core Statistical Methodology](#5-core-statistical-methodology)
+   - [Price Relatives](#price-relatives)
+   - [Jevons Elementary Formula](#jevons-elementary-formula)
+   - [Numerical Stability Implementation](#numerical-stability-implementation)
+6. [Booking Windows](#6-booking-windows)
+7. [Route Indices & Aggregation](#7-route-indices--aggregation)
+   - [Route Level Calculation](#route-level-calculation)
+   - [Configurable Reference Weights](#configurable-reference-weights)
+   - [National Aggregation](#national-aggregation)
+8. [Route Contribution Analysis](#8-route-contribution-analysis)
+9. [Reproducibility & Provenance Tracking](#9-reproducibility--provenance-tracking)
+10. [Validation & 30-Day Back-Test Framework](#10-validation--30-day-back-test-framework)
+    - [Documented Validation Metrics](#documented-validation-metrics)
+    - [Zero Fabrication Rule](#zero-fabrication-rule)
+11. [Output Contract (Data Structures)](#11-output-contract-data-structures)
+12. [How External Modules Consume This Engine](#12-how-external-modules-consume-this-engine)
+13. [Test Suite & Verification](#13-test-suite--verification)
+
+---
+
+## 1. Module Purpose & Responsibility
+
+The `statistical-engine/` module is the **authoritative calculator** of the Airfare Price Index for SIH26056.
+
+### Core Responsibilities:
+- **Authoritative Mathematical Calculation:** Computes the official Airfare Price Index using documented price relatives and Jevons / short-index elementary formulas.
+- **Route & Advance Booking Window Segmentation:** Maintains independent index series across origin-destination routes and advance purchase windows ($T+1$, $T+7$, $T+15$, $T+30$, $T+45$).
+- **Weighted National Aggregation:** Aggregates route series into a national composite index using configurable, versioned reference weights.
+- **Contribution Decomposition:** Calculates point and percentage contributions of individual routes to national index movements.
+- **Reproducibility & Audit Trail:** Attaches deterministic checksums, timestamps, and version tags to every calculated index.
+- **Back-Testing & Validation:** Provides an evaluation harness against external reference data using 7 documented statistical metrics.
+
+### Non-Responsibilities (Handled by Teammates):
+- Scraping or collection adapters (Kumuda — `data-collection/`)
+- Outlier filtering, raw fare normalization, and cleaning (Hindu — `data-quality/`)
+- AI/ML intelligence or price forecasting (Harshitha — `intelligence/`)
+- API endpoints, database tables, or auth (Mohith — `backend/`)
+- UI and dashboard visualization (Nishanth — `frontend/`)
+
+> [!NOTE]
+> AI/ML does **NOT** calculate or override the official index. The statistical engine is deterministic, pure, and mathematically auditable.
+
+---
+
+## 2. Contract Boundary & Status
+
+| Aspect | Status | Classification | Details |
+|---|---|---|---|
+| **Elementary Methodology (Jevons)** | **Finalized** | Prescribed by Methodology | Unweighted geometric mean of price relatives: $E_t = (\prod R_i)^{1/n} \times 100$ |
+| **Booking Windows** | **Finalized** | Prescribed by Methodology | Strictly $T+1$, $T+7$, $T+15$, $T+30$, $T+45$ (no cross-contamination) |
+| **National Aggregation Formula** | **Finalized** | Prescribed by Methodology | Linear weighted combination: $I_t = \sum w_i I_{i,t}$ |
+| **Route Weights ($w_i$)** | **Configurable** | Configurable Input | **Do NOT invent official weights.** Loaded via `WeightConfig`. Demo fixture provided for testing only. |
+| **Reference Benchmark Data** | **Configurable** | External Input | **Do NOT fabricate DGCA data.** Accepts external series via `BacktestRunner`. |
+| **Shared Upstream Schema** | **Pending Team Finalization** | Clean Adapter Boundary | Internal model `FareObservation` handles all documented dimensions. Adapters map external records cleanly. |
+
+---
+
+## 3. Architecture & Module Organization
+
+The engine is built using pure Python without coupling to databases, web frameworks, or ML libraries:
+
+```
+statistical-engine/
+├── pyproject.toml
+├── README.md
+├── src/
+│   └── statistical_engine/
+│       ├── __init__.py                # Package-level exports
+│       ├── engine.py                  # AirfareStatisticalEngine facade
+│       ├── models/
+│       │   ├── __init__.py
+│       │   ├── observation.py         # FareObservation, BookingWindow, QualityStatus
+│       │   ├── weights.py             # RouteWeight, WeightConfig, WeightSource
+│       │   ├── index_result.py        # ElementaryIndexResult, RouteIndexResult, NationalIndexResult
+│       │   └── validation_result.py   # ValidationMetrics, BacktestResult
+│       ├── core/
+│       │   ├── __init__.py
+│       │   ├── comparability.py       # Fare fingerprinting and exact pairing (t vs t-1)
+│       │   ├── price_relatives.py     # Price relative R_i = P_t / P_t-1 calculation & validation
+│       │   ├── jevons.py              # Log-sum numerically stable Jevons geometric mean
+│       │   └── elementary.py          # Orchestrates pairing, relatives, and Jevons
+│       ├── aggregation/
+│       │   ├── __init__.py
+│       │   ├── weights_manager.py     # Weight validation, normalization, and coverage checks
+│       │   ├── route_aggregator.py    # Route-level grouping across booking windows
+│       │   ├── national_aggregator.py # National weighted aggregation
+│       │   └── contributions.py       # Route point and level contribution decomposition
+│       └── validation/
+│           ├── __init__.py
+│           ├── metrics.py             # Correlation, MAE, RMSE, Directional Accuracy, Coverage, Stability
+│           └── backtest.py            # 30-day backtest framework runner
+└── tests/
+    ├── test_models.py
+    ├── test_comparability.py
+    ├── test_price_relatives.py
+    ├── test_jevons.py
+    ├── test_booking_windows.py
+    ├── test_route_index.py
+    ├── test_weights.py
+    ├── test_national_aggregation.py
+    ├── test_contributions.py
+    ├── test_validation_metrics.py
+    ├── test_backtest_framework.py
+    ├── test_reproducibility.py
+    └── test_end_to_end.py
+```
+
+---
+
+## 4. Input Contract (Expected Clean Observations)
+
+The statistical engine accepts cleaned, comparable observations (not raw scraped records) conforming to `FareObservation`:
+
+```python
+from datetime import date, datetime
+from statistical_engine import FareObservation, BookingWindow, QualityStatus
+
+obs = FareObservation(
+    origin="DEL",                            # 3-letter IATA code
+    destination="BOM",                       # 3-letter IATA code
+    travel_date=date(2024, 4, 15),           # Date of departure
+    observation_date=date(2024, 4, 8),       # Date fare was observed (t)
+    booking_window=BookingWindow.T_7,        # T+1, T+7, T+15, T+30, T+45
+    airline="6E",                            # Airline code
+    flight_number="6E-201",                  # Flight identifier
+    departure_time="07:00",                  # Scheduled departure time
+    cabin_class="ECONOMY",                   # Cabin class
+    fare_type="SAVER",                       # Fare brand / class
+    baggage_characteristics="15KG",          # Baggage allowance
+    comparable_fare=5400.0,                  # Total payable fare in INR (float > 0)
+    source="PORTAL_A",                       # Observation source
+    observation_timestamp=datetime.utcnow(), # Timestamp
+    quality_status=QualityStatus.VALID,      # VALID, SUSPECT, EXCLUDED
+    metadata={},                             # Optional metadata
+)
+```
+
+### Input Validation Rules:
+1. `comparable_fare`: Must be strictly positive ($> 0$), finite number. Zero, negative, `NaN`, and `Inf` are rejected with errors.
+2. `origin` and `destination`: Must be non-empty, distinct IATA codes.
+3. `travel_date` $\ge$ `observation_date`.
+4. `booking_window`: Must match one of the 5 documented booking windows.
+5. Observations marked `QualityStatus.EXCLUDED` are excluded from calculations.
+
+---
+
+## 5. Core Statistical Methodology
+
+### Comparability Matching
+Fares are matched strictly by constant-quality service characteristics between period $t$ and $t-1$:
+$$\text{Fingerprint} = \text{hash}(\text{route}, \text{window}, \text{airline}, \text{flight}, \text{dep\_time}, \text{cabin}, \text{fare\_type}, \text{baggage})$$
+
+Only records with identical fingerprints in $t$ and $t-1$ form valid comparable pairs.
+
+### Price Relatives
+For each matched pair $i$:
+$$R_i = \frac{P_{i,t}}{P_{i,t-1}}$$
+where:
+- $P_{i,t} > 0$ is current comparable fare.
+- $P_{i,t-1} > 0$ is previous comparable fare.
+
+### Jevons Elementary Formula
+The elementary price index for a specific route and booking window is computed via the Jevons formula:
+$$E_t = \left( \prod_{i=1}^n \frac{P_{i,t}}{P_{i,t-1}} \right)^{1/n} \times 100$$
+where $n$ is the number of valid matched pairs.
+
+### Numerical Stability Implementation
+To avoid floating-point overflow or underflow from direct product multiplication, the engine implements log-sum-exp:
+$$\ln(GM) = \frac{1}{n}\sum_{i=1}^n \ln(R_i)$$
+$$E_t = \exp(\ln(GM)) \times 100.0$$
+
+Edge case handling:
+- If $n = 0$: Returns `status = INSUFFICIENT_DATA`, `index_value = None`.
+- If $n = 1$: Correctly simplifies to $R_1 \times 100.0$.
+- Any non-positive relative ($R_i \le 0$) is filtered before calculation.
+
+---
+
+## 6. Booking Windows
+
+Calculations are strictly segregated into 5 documented booking windows:
+- **T+1:** 1-day advance booking (last-minute demand)
+- **T+7:** 7-day advance booking
+- **T+15:** 15-day advance booking
+- **T+30:** 30-day advance booking
+- **T+45:** 45-day advance booking
+
+> [!IMPORTANT]
+> The engine **never mixes** observations from different booking windows into an elementary index. Each booking window has its own route-level and national-level index series.
+
+---
+
+## 7. Route Indices & Aggregation
+
+### Route Level Calculation
+Routes are represented by origin and destination (e.g. `DEL-BOM`, `BOM-BLR`). The engine works with any configurable route; example routes are not hardcoded as official.
+
+### Configurable Reference Weights
+Route indices are aggregated using the `WeightConfig` model:
+
+```python
+from statistical_engine import WeightConfig, WeightSource
+
+weights = WeightConfig(
+    version="W_2024_Q1",
+    source=WeightSource.HISTORICAL_PASSENGER_TRAFFIC.value,
+    weights={
+        "DEL-BOM": 0.35,
+        "DEL-BLR": 0.25,
+        "BOM-BLR": 0.20,
+        "BLR-DEL": 0.20,
+    },
+    description="Derived from DGCA scheduled domestic passenger city-pair traffic",
+    is_official=False,  # Enforces honesty: false unless officially notified
+)
+```
+
+**Weight Validation Rules:**
+- Every weight $w_i \ge 0$.
+- Sum of weights must equal $1.0$ (or $100\%$, which auto-converts to $1.0$).
+- Total weight sum must be $> 0$.
+
+### National Aggregation
+For each booking window:
+$$I_{t}^{\text{national}} = \sum_{r \in \text{Routes}} w_r \cdot I_{r,t}$$
+
+**Authoritative Strict Basket Coverage (Default):**
+- By default, `allow_partial_coverage = False`.
+- The authoritative national index calculation enforces strict basket coverage.
+- If any route defined in the configured reference basket is missing valid index observations, the engine returns `status = INSUFFICIENT_DATA` with `national_index = None`.
+- The default calculation will **NOT** silently re-normalize the remaining route weights.
+
+**Optional Partial Basket Re-Normalization (Opt-In Only):**
+> [!WARNING]
+> Partial-basket re-normalization is an **optional engineering behavior** for development or fallback feeds and is **NOT an asserted official methodology**.
+- When explicitly enabled (`allow_partial_coverage = True`), the engine re-normalizes weights across available routes if coverage $\ge$ `min_coverage_threshold` (default 50%):
+  $$w'_r = \frac{w_r}{\sum_{k \in \text{Observed}} w_k}$$
+  The national index is computed and marked with `status = PARTIAL_COVERAGE` alongside diagnostic warnings listing all missing routes.
+- If coverage falls below `min_coverage_threshold`, calculation returns `status = INSUFFICIENT_DATA`.
+
+---
+
+## 8. Route Contribution Analysis
+
+The engine provides mathematical decomposition of route movements:
+
+1. **Level Contribution:**
+   $$C_{r,t}^{\text{level}} = w_r \cdot I_{r,t} \quad \implies \quad \sum_r C_{r,t}^{\text{level}} = I_t^{\text{national}}$$
+
+2. **Point Contribution to Period Change:**
+   $$C_{r,t}^{\text{point}} = w_r \cdot (I_{r,t} - I_{r,t-1}) \quad \implies \quad \sum_r C_{r,t}^{\text{point}} = I_t^{\text{national}} - I_{t-1}^{\text{national}} = \Delta I_t$$
+
+3. **Percentage Share of Total Movement:**
+   $$\text{Share}_r = \frac{C_{r,t}^{\text{point}}}{\Delta I_t} \times 100\% \quad (\Delta I_t \neq 0)$$
+
+---
+
+## 9. Reproducibility & Provenance Tracking
+
+Every calculation produces a `ReproducibilityMetadata` record:
+- `observation_set_version`: Version tag of the raw/cleaned observation set
+- `basket_version`: Version tag of the route basket definition
+- `weight_version`: Identifier of the weight configuration used
+- `methodology_version`: String constant (e.g. `JEVONS_SHORT_INDEX_v1.0`)
+- `calculation_timestamp`: UTC timestamp of computation
+- `execution_checksum`: SHA-256 hash computed across inputs, version strings, observation counts, and resulting national indices.
+
+Deterministic calculations guarantee that **identical inputs produce identical indices and checksums**.
+
+---
+
+## 10. Validation & 30-Day Back-Test Framework
+
+The validation layer benchmarks calculated index series against external reference data over a 30-day (or configurable) window.
+
+### Documented Validation Metrics
+
+| Metric | Formula | Description & Edge Case Behavior |
+|---|---|---|
+| **Pearson Correlation ($r$)** | $\frac{\sum (x_i - \bar{x})(y_i - \bar{y})}{\sqrt{\sum (x_i - \bar{x})^2 \sum (y_i - \bar{y})^2}}$ | Evaluates linear co-movement. If variance of either series is zero (constant series), returns `status = UNDEFINED_VARIANCE, value = None`. |
+| **Spearman Correlation ($\rho$)** | Pearson correlation applied to ranked data with average tie handling | Evaluates monotonic co-movement without linearity assumption. |
+| **Mean Absolute Error (MAE)** | $\frac{1}{n}\sum_{i=1}^n \|I_t - R_t\|$ | Average absolute divergence in index points. |
+| **Root Mean Squared Error (RMSE)** | $\sqrt{\frac{1}{n}\sum_{i=1}^n (I_t - R_t)^2}$ | Penalizes large point discrepancies. |
+| **Directional Accuracy** | $\frac{1}{n-1}\sum_{t=2}^n \mathbb{I}(\operatorname{sgn}(\Delta I_t) == \operatorname{sgn}(\Delta R_t))$ | Proportion of days where calculated index and reference series moved in the same direction ($[0.0, 1.0]$). |
+| **Coverage** | $\frac{\text{valid days evaluated}}{\text{expected calendar days}}$ | Window completeness (e.g. $28/30 = 93.3\%$). |
+| **Stability** | $\sqrt{\frac{1}{m-1}\sum (\Delta I_t - \overline{\Delta I})^2}$ | Sample standard deviation of daily first differences. Lower values indicate absence of spurious volatility. |
+
+### Zero Fabrication Rule
+> [!CAUTION]
+> The engine does **NOT** fabricate official DGCA data. Reference series must be provided externally to `BacktestRunner`. A mock benchmark generator (`generate_demo_test_reference_series`) is available strictly for unit tests and marked `is_official_reference = False`.
+
+---
+
+## 11. Output Contract (Data Structures)
+
+Top-level output returned by `AirfareStatisticalEngine.calculate_daily_indices()` is `EngineCalculationOutput`:
+
+```python
+output.observation_date          # date(2024, 4, 8)
+output.previous_observation_date # date(2024, 4, 7)
+output.status                    # CalculationStatus.SUCCESS
+output.route_results             # Dict[str, RouteIndexResult]
+output.national_results          # Dict[BookingWindow, NationalIndexResult]
+output.reproducibility           # ReproducibilityMetadata
+output.warnings                  # List[str]
+
+# Fully serializable to JSON/dict:
+data_json = output.to_dict()
+```
+
+---
+
+## 12. How External Modules Consume This Engine
+
+Other teammates can consume the statistical engine with zero external dependencies:
+
+```python
+from datetime import date
+from statistical_engine import (
+    AirfareStatisticalEngine,
+    BookingWindow,
+    WeightConfig,
+    FareObservation,
+)
+
+# 1. Initialize engine (authoritative strict basket coverage by default)
+engine = AirfareStatisticalEngine(
+    base_value=100.0,
+    # allow_partial_coverage=False (default: strict basket coverage required)
+    # Set allow_partial_coverage=True only for opt-in engineering fallback
+)
+
+# 2. Provide weights (configured from DGCA traffic or reference tables)
+weights = WeightConfig(
+    version="WEIGHTS_2024_Q1",
+    source="DGCA_CITY_PAIR_TABLE",
+    weights={"DEL-BOM": 0.5, "BOM-BLR": 0.5},
+)
+
+# 3. Calculate daily indices
+output = engine.calculate_daily_indices(
+    current_observations=current_cleaned_observations,
+    previous_observations=previous_cleaned_observations,
+    observation_date=date(2024, 4, 8),
+    previous_observation_date=date(2024, 4, 7),
+    weight_config=weights,
+    observation_set_version="OBS_20240408_01",
+    basket_version="BASKET_v1",
+)
+
+# 4. Access national index and contributions for T+7
+nat_t7 = output.national_results[BookingWindow.T_7]
+print(f"National T+7 Index: {nat_t7.national_index}")
+
+for route, contrib in nat_t7.route_contributions.items():
+    print(f"Route {route}: index={contrib.route_index}, point_contrib={contrib.point_contribution}")
+```
+
+---
+
+## 13. Test Suite & Verification
+
+The test suite covers every mathematical formula, edge case, and data boundary:
+
+- `test_models.py`: Model validation, negative/zero/NaN fare rejection, window parsing.
+- `test_comparability.py`: Constant-quality fingerprinting, pair matching, duplicate disambiguation.
+- `test_price_relatives.py`: Relative calculations, zero/negative/inf protection.
+- `test_jevons.py`: Geometric mean verification against hand-calculated analytical solutions.
+- `test_booking_windows.py`: Strict isolation of T+1, T+7, T+15, T+30, T+45.
+- `test_route_index.py`: Single and multi-route index execution.
+- `test_weights.py`: Normalization checks, partial basket coverage, auto-normalization.
+- `test_national_aggregation.py`: Linear combination verification, partial coverage handling.
+- `test_contributions.py`: Level and point contributions, sum matching aggregate delta.
+- `test_validation_metrics.py`: Correlation, MAE, RMSE, directional accuracy, constant series handling.
+- `test_backtest_framework.py`: 30-day window evaluation with date alignment and gaps.
+- `test_reproducibility.py`: Deterministic outputs, checksum verification, JSON serialization.
+- `test_end_to_end.py`: Multi-route, multi-window full pipeline test.
+- `tests/test_statistical_engine.py`: Root-level cross-module consumption test.
+
+### Running Tests:
+```bash
+# Run all unit tests
+PYTHONPATH=statistical-engine/src python3 -m unittest discover -s statistical-engine/tests -p "test_*.py" -v
+
+# Run root cross-module test
+PYTHONPATH=statistical-engine/src python3 -m unittest discover -s tests -p "test_*.py" -v
+```
