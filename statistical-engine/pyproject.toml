@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "statistical-engine"
+version = "0.1.0"
+description = "Authoritative Statistical Airfare Price Index Engine & Validation Module for SIH26056"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "Samarth", email = "samarth@example.com" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
