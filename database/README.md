@@ -1,4 +1,5 @@
-# SIH26056 about database 
+# SIH26056 about database mko
+
 
 PostgreSQL assets for durable, versioned storage of normalized observations and upstream calculation outputs. The backend owns connection/session use; this folder owns deployable schema assets.
 
