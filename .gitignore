@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 venv/
 .env
+*.egg-info/
 
 # Node / Next.js
 node_modules/
