@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 venv/
 .env
+*.egg-info/
 
 # Node / Next.js
 node_modules/
@@ -27,3 +28,5 @@ pnpm-debug.log*
 data/
 artifacts/
 secrets/
+*.xlsx
+*.xls

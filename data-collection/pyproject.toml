@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "airfare-data-collection"
+version = "0.1.0"
+description = "Data collection module for the SIH26056 Airfare Index project"
+requires-python = ">=3.10"
+
+dependencies = [
+    "requests",
+    "python-dotenv",
+    "pandas",
+    "openpyxl",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
