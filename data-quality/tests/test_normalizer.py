@@ -13,7 +13,90 @@ from data_quality.normalizer import (
     normalize_source,
     normalize_text,
 )
+from datetime import date, datetime
 
+import pytest
+
+from data_quality.models import RawFareObservation
+from data_quality.normalizer import (
+    normalize_source,
+    normalize_fare_observation,
+)
+
+
+def make_raw_observation(**overrides):
+    data = {
+        "observation_timestamp": datetime(
+            2026, 9, 1, 10, 0
+        ),
+        "origin": "DEL",
+        "destination": "BOM",
+        "travel_date": date(2026, 9, 8),
+        "observation_date": date(2026, 9, 1),
+        "airline": "IndiGo",
+        "flight_number": "6E123",
+        "departure_time": "10:30",
+        "cabin_class": "Economy",
+        "fare_type": "Regular",
+        "baggage_characteristics": "15KG",
+        "base_fare": 4500,
+        "taxes": 700,
+        "mandatory_charges": 100,
+        "source": "MMT",
+    }
+
+    data.update(overrides)
+
+    return RawFareObservation(**data)
+
+
+def test_source_alias_mmt_maps_to_canonical_name():
+    assert normalize_source("MMT") == "MAKEMYTRIP"
+
+
+def test_source_alias_make_my_trip_maps_to_canonical_name():
+    assert normalize_source("Make My Trip") == "MAKEMYTRIP"
+
+
+def test_source_alias_indigo_maps_to_canonical_name():
+    assert normalize_source("6E") == "INDIGO"
+
+
+def test_source_alias_air_india_maps_to_canonical_name():
+    assert normalize_source("AI") == "AIR INDIA"
+
+
+def test_unknown_source_is_not_silently_mapped():
+    with pytest.raises(ValueError, match="unknown source"):
+        normalize_source("UNKNOWN-FLIGHT-SITE")
+
+
+def test_source_is_not_part_of_fingerprint():
+    first = normalize_fare_observation(
+        make_raw_observation(source="MMT")
+    )
+
+    second = normalize_fare_observation(
+        make_raw_observation(source="Make My Trip")
+    )
+
+    assert first.source == "MAKEMYTRIP"
+    assert second.source == "MAKEMYTRIP"
+    assert first.fingerprint == second.fingerprint
+
+
+def test_missing_fare_is_not_valid():
+    observation = make_raw_observation(
+        base_fare=None
+    )
+
+    normalized = normalize_fare_observation(
+        observation
+    )
+
+    assert normalized.comparable_fare is None
+    assert normalized.quality_status.value == "EXCLUDED"
+    assert normalized.quality_reason == "MISSING_FARE"
 
 def create_raw_observation(**overrides):
     """

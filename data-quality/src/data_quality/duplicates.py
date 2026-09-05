@@ -1,21 +1,10 @@
 """
 Duplicate detection for SIH26056.
-
-This module identifies exact duplicate fare observations.
-
-A record is considered an exact duplicate when the same:
-- fare fingerprint
-- observation timestamp
-- source
-
-appears more than once.
-
-Repeated observations at different times are NOT duplicates.
 """
 
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Iterable, List, Tuple
 
 from .models import (
     NormalizedFareObservation,
@@ -23,11 +12,15 @@ from .models import (
 )
 
 
-def _duplicate_key(
+def duplicate_key(
     observation: NormalizedFareObservation,
-) -> tuple[str, object, str]:
+) -> Tuple[str, object, str]:
     """
-    Build the key used to identify an exact duplicate.
+    Build the exact duplicate key.
+
+    Source and observation timestamp are included so that the same
+    fare observed at a different time is not treated as an exact
+    duplicate.
     """
 
     return (
@@ -38,20 +31,22 @@ def _duplicate_key(
 
 
 def find_duplicate_indices(
-    observations: Iterable[NormalizedFareObservation],
-) -> list[int]:
+    observations: Iterable[
+        NormalizedFareObservation
+    ],
+) -> List[int]:
     """
-    Return the indexes of observations that are exact duplicates.
+    Return indices of duplicate observations.
 
-    The first occurrence is kept.
-    Later occurrences with the same duplicate key are returned.
+    The first occurrence is retained.
+    Later exact duplicates are returned.
     """
 
-    seen: set[tuple[str, object, str]] = set()
-    duplicate_indices: list[int] = []
+    seen = set()
+    duplicate_indices = []
 
     for index, observation in enumerate(observations):
-        key = _duplicate_key(observation)
+        key = duplicate_key(observation)
 
         if key in seen:
             duplicate_indices.append(index)
@@ -61,39 +56,55 @@ def find_duplicate_indices(
     return duplicate_indices
 
 
+def is_duplicate(
+    observation: NormalizedFareObservation,
+    existing_keys: set,
+) -> bool:
+    """Check whether an observation's duplicate key already exists."""
+
+    return duplicate_key(observation) in existing_keys
+
+
 def mark_duplicates(
-    observations: list[NormalizedFareObservation],
-) -> list[NormalizedFareObservation]:
+    observations: Iterable[
+        NormalizedFareObservation
+    ],
+) -> List[NormalizedFareObservation]:
     """
-    Mark duplicate observations as EXCLUDED.
+    Mark later exact duplicate observations as EXCLUDED.
 
-    The original observations are retained in the list.
-    Only their quality status and reason are changed.
+    Observations are not deleted.
     """
 
-    duplicate_indices = find_duplicate_indices(
-        observations
-    )
+    observations = list(observations)
 
-    for index in duplicate_indices:
-        observations[index].quality_status = (
-            QualityStatus.EXCLUDED
-        )
-        observations[index].quality_reason = (
-            "exact duplicate observation"
-        )
+    seen = set()
+
+    for observation in observations:
+        key = duplicate_key(observation)
+
+        if key in seen:
+            observation.quality_status = (
+                QualityStatus.EXCLUDED
+            )
+            observation.quality_reason = (
+                "exact duplicate observation"
+            )
+
+            observation.metadata[
+                "quality_reason_code"
+            ] = "DUPLICATE"
+
+        else:
+            seen.add(key)
 
     return observations
-
-
 def count_duplicates(
-    observations: Iterable[NormalizedFareObservation],
+    observations: Iterable[
+        NormalizedFareObservation
+    ],
 ) -> int:
-    """
-    Return the number of duplicate records.
-
-    The first occurrence of a record is not counted as a duplicate.
-    """
+    """Return the number of duplicate observations."""
 
     return len(
         find_duplicate_indices(observations)
