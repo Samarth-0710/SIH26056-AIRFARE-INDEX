@@ -60,6 +60,38 @@ class AnomalyResult:
             "warnings": list(self.warnings),
         }
 
+@dataclass(frozen=True)
+class CrossSourceConfirmationResult:
+    route: str
+    booking_window: str
+    observation_date: str
+    sources: List[str] = field(default_factory=list)
+    source_count: int = 0
+    agreeing_sources: List[str] = field(default_factory=list)
+    agreement_ratio: Optional[float] = None
+    direction: Optional[str] = None
+    confirmed: bool = False
+    strength: Optional[str] = None
+    reason: Optional[str] = None
+    status: IntelligenceStatus = IntelligenceStatus.SUCCESS
+    warnings: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict:
+        return {
+            "route": self.route,
+            "booking_window": self.booking_window,
+            "observation_date": self.observation_date,
+            "sources": list(self.sources),
+            "source_count": self.source_count,
+            "agreeing_sources": list(self.agreeing_sources),
+            "agreement_ratio": self.agreement_ratio,
+            "direction": self.direction,
+            "confirmed": self.confirmed,
+            "strength": self.strength,
+            "reason": self.reason,
+            "status": self.status.value,
+            "warnings": list(self.warnings),
+        }
 
 @dataclass(frozen=True)
 class IntelligenceOutput:
