@@ -9,8 +9,9 @@ from typing import Iterable, Optional
 class MissingDataSupportResult:
     """Supporting result for a missing fare observation.
 
-    This does not automatically replace missing values in the
-    official Statistical Engine.
+    This result represents an estimate only. It does not
+    automatically replace a missing value in the official
+    Statistical Engine.
     """
 
     route: str
@@ -19,6 +20,12 @@ class MissingDataSupportResult:
     comparable_observations: int
     confidence: str
     used: bool
+
+    # Explicit estimation/provenance information.
+    original_value_missing: bool
+    estimated: bool
+    estimation_method: Optional[str]
+
     reason: str
 
     def to_dict(self) -> dict:
@@ -26,9 +33,18 @@ class MissingDataSupportResult:
             "route": self.route,
             "booking_window": self.booking_window,
             "estimated_fare": self.estimated_fare,
-            "comparable_observations": self.comparable_observations,
+            "comparable_observations": (
+                self.comparable_observations
+            ),
             "confidence": self.confidence,
             "used": self.used,
+            "original_value_missing": (
+                self.original_value_missing
+            ),
+            "estimated": self.estimated,
+            "estimation_method": (
+                self.estimation_method
+            ),
             "reason": self.reason,
         }
 
@@ -39,21 +55,32 @@ class MissingDataSupporter:
 
     The estimate uses the median of comparable observed fares.
 
-    It is intended as supporting intelligence only. The official
-    Statistical Engine must decide whether such an estimate is
-    methodologically permitted for index calculation.
+    This component is Intelligence-layer support only.
+
+    It does NOT:
+      - replace missing values automatically
+      - modify the official Statistical Engine
+      - classify an estimate as an actual observation
+      - decide whether imputation is permitted for the official index
     """
 
-    def __init__(self, minimum_observations: int = 3) -> None:
+    def __init__(
+        self,
+        minimum_observations: int = 3,
+    ) -> None:
         if minimum_observations < 1:
             raise ValueError(
                 "minimum_observations must be at least 1"
             )
 
-        self.minimum_observations = minimum_observations
+        self.minimum_observations = (
+            minimum_observations
+        )
 
     @staticmethod
-    def _valid_fares(fares: Iterable[float]) -> list[float]:
+    def _valid_fares(
+        fares: Iterable[float],
+    ) -> list[float]:
         valid = []
 
         for fare in fares:
@@ -73,9 +100,17 @@ class MissingDataSupporter:
         booking_window: str,
         comparable_fares: Iterable[float],
     ) -> MissingDataSupportResult:
-        valid_fares = self._valid_fares(comparable_fares)
+        valid_fares = self._valid_fares(
+            comparable_fares
+        )
 
         count = len(valid_fares)
+
+        # ---------------------------------------------------------
+        # Insufficient comparable observations.
+        #
+        # No estimate is produced and nothing is marked as used.
+        # ---------------------------------------------------------
 
         if count < self.minimum_observations:
             return MissingDataSupportResult(
@@ -85,13 +120,27 @@ class MissingDataSupporter:
                 comparable_observations=count,
                 confidence="INSUFFICIENT_DATA",
                 used=False,
+                original_value_missing=True,
+                estimated=False,
+                estimation_method=None,
                 reason=(
-                    "Insufficient comparable observations for "
-                    "a supporting missing-data estimate."
+                    "Insufficient comparable observations "
+                    "for a supporting missing-data estimate. "
+                    "No replacement value was produced."
                 ),
             )
 
-        estimated_fare = round(median(valid_fares), 2)
+        # ---------------------------------------------------------
+        # Conservative estimate.
+        #
+        # Median is used because it is less sensitive to extreme
+        # observations than the arithmetic mean.
+        # ---------------------------------------------------------
+
+        estimated_fare = round(
+            median(valid_fares),
+            2,
+        )
 
         if count >= 5:
             confidence = "HIGH"
@@ -105,8 +154,14 @@ class MissingDataSupporter:
             comparable_observations=count,
             confidence=confidence,
             used=True,
+            original_value_missing=True,
+            estimated=True,
+            estimation_method="MEDIAN",
             reason=(
-                f"Supporting estimate based on the median of "
-                f"{count} comparable observations."
+                f"Supporting estimate based on the median "
+                f"of {count} comparable observations. "
+                "The estimated value must remain explicitly "
+                "identified as estimated and must not be "
+                "silently treated as an actual fare."
             ),
         )

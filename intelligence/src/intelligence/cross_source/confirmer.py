@@ -192,9 +192,11 @@ class CrossSourceConfirmer:
         fares: List[float] = []
 
         for observation in observations:
-            value = observation.get("comparable_fare") if isinstance(
-                observation, dict
-            ) else getattr(observation, "comparable_fare", None)
+            value = (
+                observation.get("comparable_fare")
+                if isinstance(observation, dict)
+                else getattr(observation, "comparable_fare", None)
+            )
 
             try:
                 fare = float(value)
@@ -214,22 +216,84 @@ class CrossSourceConfirmer:
         current_observations: Iterable[Any],
         previous_observations: Iterable[Any],
     ) -> Dict[Tuple[str, str, str, str], SourceMovement]:
-        current_groups = self._group_observations(current_observations)
-        previous_groups = self._group_observations(previous_observations)
+        """
+        Calculate source-level fare movements.
+
+        Current and previous observations are matched using:
+
+            route + booking window + source
+
+        Observation date is deliberately NOT part of the matching key,
+        because current and previous observations are expected to come
+        from different observation dates.
+
+        Example:
+
+            Current:
+                DEL-BOM + T+7 + SOURCE_A + 2026-09-04
+
+            Previous:
+                DEL-BOM + T+7 + SOURCE_A + 2026-09-03
+
+        These observations represent the same source/route/window
+        comparison across consecutive observation dates.
+        """
+
+        current_groups = self._group_observations(
+            current_observations
+        )
+        previous_groups = self._group_observations(
+            previous_observations
+        )
+
+        # Build lookup keys without observation date.
+        current_lookup: Dict[
+            Tuple[str, str, str],
+            List[Any],
+        ] = defaultdict(list)
+
+        previous_lookup: Dict[
+            Tuple[str, str, str],
+            List[Any],
+        ] = defaultdict(list)
+
+        for (
+            route,
+            booking_window,
+            _observation_date,
+            source,
+        ), observations in current_groups.items():
+            current_lookup[
+                (route, booking_window, source)
+            ].extend(observations)
+
+        for (
+            route,
+            booking_window,
+            _observation_date,
+            source,
+        ), observations in previous_groups.items():
+            previous_lookup[
+                (route, booking_window, source)
+            ].extend(observations)
 
         movements: Dict[
             Tuple[str, str, str, str],
             SourceMovement,
         ] = {}
 
-        for key, current_group in current_groups.items():
-            previous_group = previous_groups.get(key)
+        for key, current_group in current_lookup.items():
+            previous_group = previous_lookup.get(key)
 
             if not previous_group:
                 continue
 
-            current_fare = self._average_fare(current_group)
-            previous_fare = self._average_fare(previous_group)
+            current_fare = self._average_fare(
+                current_group
+            )
+            previous_fare = self._average_fare(
+                previous_group
+            )
 
             if current_fare is None or previous_fare is None:
                 continue
@@ -249,9 +313,37 @@ class CrossSourceConfirmer:
             else:
                 direction = "DOWNWARD"
 
-            route, booking_window, observation_date, source = key
+            route, booking_window, source = key
 
-            movements[key] = SourceMovement(
+            # Find the current observation date for the result.
+            current_dates = [
+                observation_date
+                for (
+                    group_route,
+                    group_window,
+                    observation_date,
+                    group_source,
+                ) in current_groups
+                if (
+                    group_route == route
+                    and group_window == booking_window
+                    and group_source == source
+                )
+            ]
+
+            if not current_dates:
+                continue
+
+            observation_date = sorted(current_dates)[-1]
+
+            movements[
+                (
+                    route,
+                    booking_window,
+                    observation_date,
+                    source,
+                )
+            ] = SourceMovement(
                 source=source,
                 previous_fare=previous_fare,
                 current_fare=current_fare,
@@ -273,7 +365,7 @@ class CrossSourceConfirmer:
         observations from the Data Quality layer.
 
         Results are generated separately for each route, booking window,
-        and observation date.
+        and current observation date.
         """
         movements = self._source_movements(
             current_observations,
@@ -292,7 +384,11 @@ class CrossSourceConfirmer:
             route, booking_window, observation_date, _source = key
 
             grouped[
-                (route, booking_window, observation_date)
+                (
+                    route,
+                    booking_window,
+                    observation_date,
+                )
             ].append(movement)
 
         results: List[CrossSourceConfirmationResult] = []
@@ -302,6 +398,7 @@ class CrossSourceConfirmer:
             booking_window,
             observation_date,
         ), source_movements in sorted(grouped.items()):
+
             sources = sorted(
                 movement.source
                 for movement in source_movements
@@ -364,12 +461,15 @@ class CrossSourceConfirmer:
             )
 
             agreement_ratio = (
-                len(agreeing_movements) / source_count
+                len(agreeing_movements)
+                / source_count
             )
 
             confirmed = (
-                len(agreeing_movements) >= self.minimum_sources
-                and agreement_ratio >= self.minimum_agreement_ratio
+                len(agreeing_movements)
+                >= self.minimum_sources
+                and agreement_ratio
+                >= self.minimum_agreement_ratio
                 and direction != "STABLE"
             )
 
@@ -387,14 +487,16 @@ class CrossSourceConfirmer:
             elif agreement_ratio >= 0.75:
                 strength = "STRONG"
                 reason = (
-                    f"{len(agreeing_sources)} of {source_count} sources "
-                    f"support a {direction.lower()} movement."
+                    f"{len(agreeing_sources)} of {source_count} "
+                    f"sources support a "
+                    f"{direction.lower()} movement."
                 )
             else:
                 strength = "MODERATE"
                 reason = (
-                    f"{len(agreeing_sources)} of {source_count} sources "
-                    f"support a {direction.lower()} movement."
+                    f"{len(agreeing_sources)} of {source_count} "
+                    f"sources support a "
+                    f"{direction.lower()} movement."
                 )
 
             results.append(

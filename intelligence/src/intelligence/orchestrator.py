@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from intelligence.anomaly.detector import AnomalyDetector
@@ -12,6 +13,7 @@ from intelligence.missing_data.supporter import MissingDataSupporter
 from intelligence.models.result import (
     AnomalyResult,
     IntelligenceOutput,
+    IntelligenceProvenance,
     IntelligenceStatus,
 )
 
@@ -84,7 +86,19 @@ class IntelligenceOrchestrator:
         current_observations: Optional[List[Any]] = None,
         previous_observations: Optional[List[Any]] = None,
         coverage_ratio: Optional[float] = None,
-        missing_route_fares: Optional[Dict[str, List[float]]] = None,
+        missing_route_fares: Optional[
+            Dict[str, List[float]]
+        ] = None,
+        previous_movements: Optional[
+            Dict[str, Optional[float]]
+        ] = None,
+        historical_baseline: Optional[
+            Dict[str, float]
+        ] = None,
+        freshness_hours: Optional[float] = None,
+        data_quality: Optional[
+            Dict[str, Any]
+        ] = None,
     ) -> IntelligenceOutput:
         """
         Run the complete supporting intelligence pipeline.
@@ -96,42 +110,15 @@ class IntelligenceOrchestrator:
         - cross-source confirmation
         - supporting missing-data estimation
 
-        coverage_ratio enables the confidence support signal.
+        Additional optional inputs enable the enhanced shock detector:
+        - previous route movements
+        - historical route baselines
+        - freshness
+        - data-quality information
+        - coverage
 
-        Parameters
-        ----------
-        observation_date:
-            Date of the current index observation.
-
-        current_route_indices:
-            Current route-level index values from the Statistical Engine.
-
-        previous_route_indices:
-            Previous route-level index values from the Statistical Engine.
-
-        historical_route_indices:
-            Optional historical index series for each route.
-            Values must be ordered oldest to newest.
-
-        booking_window:
-            One of:
-            T+1, T+7, T+15, T+30, T+45.
-
-        current_observations:
-            Optional normalized fare observations for the current
-            observation date.
-
-        previous_observations:
-            Optional normalized fare observations for the previous
-            observation date.
-
-        coverage_ratio:
-            Optional data coverage ratio supplied by the statistical
-            pipeline.
-
-        missing_route_fares:
-            Optional mapping of route to comparable fares that can
-            support a missing-data estimate.
+        The Intelligence layer does not modify or replace the
+        Statistical Engine's official index.
         """
 
         anomalies: List[AnomalyResult] = []
@@ -151,8 +138,6 @@ class IntelligenceOrchestrator:
                 previous_index=previous_index,
             )
 
-            # Add a human-readable explanation when an anomaly
-            # has been detected.
             if result.detected:
                 explanation = self.explainer.explain(result)
 
@@ -192,27 +177,39 @@ class IntelligenceOrchestrator:
                 )
 
         # ---------------------------------------------------------
-        # 3. Shock detection
-        # ---------------------------------------------------------
-
-        shock_result = self.shock_detector.detect(
-            route_indices=current_route_indices,
-            previous_route_indices=previous_route_indices,
-        )
-
-        # ---------------------------------------------------------
-        # 4. Cross-source confirmation
+        # 3. Cross-source confirmation
         # ---------------------------------------------------------
 
         cross_source_results = []
 
-        if current_observations is not None and previous_observations is not None:
+        if (
+            current_observations is not None
+            and previous_observations is not None
+        ):
             cross_source_results = (
                 self.cross_source_confirmer.confirm(
                     current_observations=current_observations,
                     previous_observations=previous_observations,
                 )
             )
+
+        # ---------------------------------------------------------
+        # 4. Shock detection
+        # ---------------------------------------------------------
+
+        shock_result = self.shock_detector.detect(
+            route_indices=current_route_indices,
+            previous_route_indices=previous_route_indices,
+            previous_movements=previous_movements,
+            cross_source_confirmations=[
+                result.to_dict()
+                for result in cross_source_results
+            ],
+            coverage_ratio=coverage_ratio,
+            historical_baseline=historical_baseline,
+            freshness_hours=freshness_hours,
+            data_quality=data_quality,
+        )
 
         # ---------------------------------------------------------
         # 5. Airfare pressure score
@@ -230,7 +227,9 @@ class IntelligenceOrchestrator:
                     and confirmation.booking_window
                     == anomaly.booking_window
                 ):
-                    agreement_ratio = confirmation.agreement_ratio
+                    agreement_ratio = (
+                        confirmation.agreement_ratio
+                    )
                     break
 
             pressure_results[anomaly.route] = (
@@ -259,8 +258,41 @@ class IntelligenceOrchestrator:
                     and confirmation.booking_window
                     == anomaly.booking_window
                 ):
-                    agreement_ratio = confirmation.agreement_ratio
+                    agreement_ratio = (
+                        confirmation.agreement_ratio
+                    )
                     break
+
+            route_data_quality = None
+
+            if isinstance(data_quality, dict):
+                candidate_quality = (
+                    data_quality.get(anomaly.route)
+                )
+
+                if isinstance(candidate_quality, (int, float)):
+                    route_data_quality = float(
+                        candidate_quality
+                    )
+
+                elif isinstance(candidate_quality, dict):
+                    for key in (
+                        "quality_score",
+                        "data_quality",
+                        "score",
+                    ):
+                        value = candidate_quality.get(key)
+
+                        if isinstance(value, (int, float)):
+                            route_data_quality = float(value)
+                            break
+
+            observation_count = None
+
+            if current_observations is not None:
+                observation_count = len(
+                    current_observations
+                )
 
             confidence_results[anomaly.route] = (
                 self.confidence_scorer.calculate(
@@ -271,6 +303,10 @@ class IntelligenceOrchestrator:
                     anomaly_available=(
                         anomaly.percentage_change is not None
                     ),
+                    observation_count=observation_count,
+                    expected_observation_count=None,
+                    data_quality=route_data_quality,
+                    freshness_hours=freshness_hours,
                 ).to_dict()
             )
 
@@ -293,21 +329,85 @@ class IntelligenceOrchestrator:
                 )
 
         # ---------------------------------------------------------
-        # 8. Construct unified Intelligence output
+        # 8. Unified metadata
         # ---------------------------------------------------------
 
         metadata = {
             "booking_window": booking_window,
+
             "patterns": pattern_results,
+
             "shock": shock_result,
+
             "cross_source_confirmation": [
                 result.to_dict()
                 for result in cross_source_results
             ],
+
             "pressure_scores": pressure_results,
+
             "confidence_support": confidence_results,
+
             "missing_data_support": missing_data_results,
         }
+
+        # ---------------------------------------------------------
+        # 9. Intelligence provenance
+        # ---------------------------------------------------------
+        #
+        # The current Intelligence implementation is primarily
+        # deterministic/rule-based. Therefore no training dataset
+        # is claimed.
+        #
+        # Reference dataset information will be populated only
+        # when an actual versioned reference dataset is supplied.
+        #
+        # Component names are recorded for reproducibility without
+        # inventing undocumented threshold/configuration values.
+        # ---------------------------------------------------------
+
+        generated_at = datetime.now(
+            timezone.utc
+        ).isoformat()
+
+        provenance = IntelligenceProvenance(
+            model_version="intelligence-rules-v1",
+            feature_version="features-v1",
+            training_dataset_version="NOT_APPLICABLE",
+            reference_dataset_version="NOT_APPLICABLE",
+            generated_at=generated_at,
+            configuration={
+                "anomaly_detector": (
+                    type(self.anomaly_detector).__name__
+                ),
+                "pattern_detector": (
+                    type(self.pattern_detector).__name__
+                ),
+                "shock_detector": (
+                    type(self.shock_detector).__name__
+                ),
+                "cross_source_confirmer": (
+                    type(
+                        self.cross_source_confirmer
+                    ).__name__
+                ),
+                "pressure_scorer": (
+                    type(self.pressure_scorer).__name__
+                ),
+                "confidence_scorer": (
+                    type(self.confidence_scorer).__name__
+                ),
+                "missing_data_supporter": (
+                    type(
+                        self.missing_data_supporter
+                    ).__name__
+                ),
+            },
+        )
+
+        # ---------------------------------------------------------
+        # 10. Construct unified Intelligence output
+        # ---------------------------------------------------------
 
         return IntelligenceOutput(
             observation_date=observation_date,
@@ -315,4 +415,5 @@ class IntelligenceOrchestrator:
             status=IntelligenceStatus.SUCCESS,
             warnings=[],
             metadata=metadata,
+            provenance=provenance,
         )
