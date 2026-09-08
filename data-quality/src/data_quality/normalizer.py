@@ -1,33 +1,18 @@
 """
 Fare normalization for SIH26056.
 
-This module converts RawFareObservation objects into
-NormalizedFareObservation objects.
-
-Responsibilities:
-- normalize text and route values
-- normalize fare values
-- calculate comparable mandatory fare
-- calculate booking window
-- generate fare fingerprint
-- preserve fare components for auditing
-
-This module does NOT:
-- calculate airfare indices
-- calculate price relatives
-- apply statistical weights
-- calculate the national index
-- automatically remove outliers
+This module converts raw airfare observations into normalized
+observations compatible with the Statistical Index Engine.
 """
 
 from __future__ import annotations
 
-import math
-from datetime import date
+from datetime import date, datetime
+from math import isfinite
 from typing import Optional
 
 from .booking_window import calculate_booking_window
-from .fingerprint import generate_fare_fingerprint
+from .fingerprint import generate_fingerprint
 from .models import (
     NormalizedFareObservation,
     QualityStatus,
@@ -35,168 +20,279 @@ from .models import (
 )
 
 
-def normalize_text(value: Optional[str]) -> str:
-    """
-    Normalize a text field.
+# ---------------------------------------------------------------------------
+# Supported source aliases
+# ---------------------------------------------------------------------------
 
-    Leading/trailing whitespace is removed and text is
-    converted to uppercase.
-    """
+SOURCE_ALIASES = {
+    # Airlines
+    "INDIGO": "INDIGO",
+    "INDIGO AIRLINES": "INDIGO",
+    "6E": "INDIGO",
+
+    "AIR INDIA": "AIR INDIA",
+    "AIRINDIA": "AIR INDIA",
+    "AI": "AIR INDIA",
+
+    "AKASA": "AKASA AIR",
+    "AKASA AIR": "AKASA AIR",
+    "AKASA AIRLINES": "AKASA AIR",
+    "QP": "AKASA AIR",
+
+    "SPICEJET": "SPICEJET",
+    "SPICE JET": "SPICEJET",
+    "SG": "SPICEJET",
+
+    # OTAs
+    "MAKEMYTRIP": "MAKEMYTRIP",
+    "MAKE MY TRIP": "MAKEMYTRIP",
+    "MAKE MYTRIP": "MAKEMYTRIP",
+    "MMT": "MAKEMYTRIP",
+
+    "YATRA": "YATRA",
+    "YATRA.COM": "YATRA",
+
+    "CLEARTRIP": "CLEARTRIP",
+    "CLEAR TRIP": "CLEARTRIP",
+
+    "IXIGO": "IXIGO",
+    "IXIGO.COM": "IXIGO",
+
+    # Controlled test source
+    "TEST": "TEST",
+}
+
+
+# ---------------------------------------------------------------------------
+# Text helpers
+# ---------------------------------------------------------------------------
+
+def normalize_text(value: Optional[object]) -> str:
+    """Normalize text by trimming, upper-casing and collapsing whitespace."""
+
     if value is None:
         return ""
 
-    return str(value).strip().upper()
+    return " ".join(
+        str(value).strip().upper().split()
+    )
 
 
-def normalize_route_code(value: Optional[str]) -> str:
-    """
-    Normalize an airport/route code.
-    """
+def normalize_route_code(value: Optional[object]) -> str:
+    """Normalize an airport code or route component."""
+
     return normalize_text(value)
 
 
-def normalize_source(value: Optional[str]) -> str:
+# ---------------------------------------------------------------------------
+# Source helpers
+# ---------------------------------------------------------------------------
+
+def normalize_source(value: Optional[object]) -> str:
     """
-    Normalize the source name.
+    Convert a source alias to its canonical source name.
+
+    Unknown sources are rejected rather than silently mapped.
     """
-    return normalize_text(value)
+
+    normalized = normalize_text(value)
+
+    if normalized not in SOURCE_ALIASES:
+        raise ValueError(
+            f"unknown source: {value}"
+        )
+
+    return SOURCE_ALIASES[normalized]
 
 
-def normalize_fare_value(value: object) -> Optional[float]:
+def is_known_source(value: Optional[object]) -> bool:
+    """Return True if the supplied source is supported."""
+
+    if value is None:
+        return False
+
+    return normalize_text(value) in SOURCE_ALIASES
+
+
+# ---------------------------------------------------------------------------
+# Fare helpers
+# ---------------------------------------------------------------------------
+
+def normalize_fare_value(
+    value: Optional[object],
+) -> Optional[float]:
     """
-    Convert a raw fare value into a float.
+    Convert a raw fare value to a finite float.
 
-    Handles values such as:
+    This function performs numeric normalization only.
 
-        5000
-        5000.50
-        "5,000"
-        "₹5,000"
-        "INR 5,000"
-        "inr 5,000"
+    Important:
+    Negative values are preserved here so validation logic can identify
+    them as invalid fares. They are not silently converted to None.
 
-    Returns None when the value cannot be converted.
+    Examples:
+        4500       -> 4500.0
+        "4,500"    -> 4500.0
+        "₹4,500"   -> 4500.0
+        -500       -> -500.0
+        "abc"      -> None
+        None       -> None
     """
 
     if value is None:
         return None
 
-    # bool is a subclass of int, so reject it explicitly.
     if isinstance(value, bool):
         return None
 
-    # Numeric values.
-    if isinstance(value, (int, float)):
-        numeric_value = float(value)
+    if isinstance(value, str):
+        cleaned = value.strip()
 
-        if not math.isfinite(numeric_value):
+        if not cleaned:
             return None
 
-        return numeric_value
+        cleaned = (
+            cleaned
+            .replace("₹", "")
+            .replace(",", "")
+            .replace("INR", "")
+            .replace("Rs.", "")
+            .replace("Rs", "")
+            .strip()
+        )
 
-    text = str(value).strip()
+        if not cleaned:
+            return None
 
-    if not text:
+        try:
+            number = float(cleaned)
+        except (TypeError, ValueError):
+            return None
+
+    else:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+
+    if not isfinite(number):
         return None
 
-    # Normalize currency text before removing the currency marker.
-    cleaned = (
-        text
-        .replace("₹", "")
-        .replace("INR", "")
-        .replace("inr", "")
-        .replace(",", "")
-        .strip()
-    )
+    return number
 
-    try:
-        numeric_value = float(cleaned)
-    except ValueError:
-        return None
 
-    if not math.isfinite(numeric_value):
-        return None
-
-    return numeric_value
-
+# ---------------------------------------------------------------------------
+# Comparable fare
+# ---------------------------------------------------------------------------
 
 def calculate_comparable_fare(
-    base_fare: Optional[float],
-    taxes: Optional[float],
-    mandatory_charges: Optional[float],
+    base_fare: Optional[object],
+    taxes: Optional[object],
+    mandatory_charges: Optional[object],
+    total_fare: Optional[object] = None,
 ) -> Optional[float]:
     """
-    Calculate the comparable mandatory fare.
+    Calculate the comparable fare.
 
-    Comparable fare:
+    The preferred calculation is:
 
-        base fare
-        + taxes
-        + mandatory charges
+        base fare + taxes + mandatory charges
 
-    Optional extras such as voluntary seat selection or meals
-    are not included.
+    All three components must be present and positive.
+
+    If a component is missing or invalid, None is returned.
+
+    A supplied total fare is used only as a fallback when all required
+    fare components are unavailable.
     """
 
+    base = normalize_fare_value(base_fare)
+    tax = normalize_fare_value(taxes)
+    mandatory = normalize_fare_value(mandatory_charges)
+
+    # The documented comparable fare requires all three mandatory
+    # components to be available and positive.
     if (
-        base_fare is None
-        or taxes is None
-        or mandatory_charges is None
+        base is not None
+        and tax is not None
+        and mandatory is not None
+        and base > 0
+        and tax > 0
+        and mandatory > 0
     ):
-        return None
+        return base + tax + mandatory
 
-    if (
-        base_fare < 0
-        or taxes < 0
-        or mandatory_charges < 0
-    ):
-        return None
+    # If a complete component breakdown is unavailable, use a valid
+    # total fare as fallback.
+    total = normalize_fare_value(total_fare)
 
-    return base_fare + taxes + mandatory_charges
+    if total is not None and total > 0:
+        return total
 
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Observation date
+# ---------------------------------------------------------------------------
 
 def _get_observation_date(
     observation: RawFareObservation,
 ) -> date:
-    """
-    Determine the observation date.
-
-    Prefer the explicitly supplied observation_date.
-
-    If it is missing, derive the date from observation_timestamp.
-    """
+    """Get the observation date from the explicit date or timestamp."""
 
     if observation.observation_date is not None:
+        if isinstance(
+            observation.observation_date,
+            datetime,
+        ):
+            return observation.observation_date.date()
+
         return observation.observation_date
 
-    return observation.observation_timestamp.date()
+    if isinstance(
+        observation.observation_timestamp,
+        datetime,
+    ):
+        return observation.observation_timestamp.date()
 
+    raise ValueError(
+        "Observation date is required"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main normalization
+# ---------------------------------------------------------------------------
 
 def normalize_fare_observation(
     observation: RawFareObservation,
 ) -> NormalizedFareObservation:
     """
-    Convert one raw airfare observation into the common
-    normalized fare structure.
-
-    The normalized structure is designed to be compatible
-    with the Statistical Engine's FareObservation contract.
+    Normalize one raw airfare observation.
     """
 
-    if observation.travel_date is None:
-        raise ValueError(
-            "Travel date is required for normalization."
+    if not isinstance(
+        observation,
+        RawFareObservation,
+    ):
+        raise TypeError(
+            "observation must be a RawFareObservation"
         )
 
+    # Travel date is mandatory.
+    if observation.travel_date is None:
+        raise ValueError(
+            "Travel date is required"
+        )
+
+    travel_date = observation.travel_date
     observation_date = _get_observation_date(observation)
 
-    # Calculate the exact lead-time booking window.
-    booking_window = calculate_booking_window(
-        observation_date,
-        observation.travel_date,
-    )
+    # -----------------------------------------------------------------------
+    # Route
+    # -----------------------------------------------------------------------
 
-    # Normalize identifying information.
     origin = normalize_route_code(
         observation.origin
     )
@@ -204,6 +300,33 @@ def normalize_fare_observation(
     destination = normalize_route_code(
         observation.destination
     )
+
+    if not origin:
+        raise ValueError(
+            "Origin is required"
+        )
+
+    if not destination:
+        raise ValueError(
+            "Destination is required"
+        )
+
+    if origin == destination:
+        raise ValueError(
+            "Origin and destination cannot be the same"
+        )
+
+    # -----------------------------------------------------------------------
+    # Source
+    # -----------------------------------------------------------------------
+
+    source = normalize_source(
+        observation.source
+    )
+
+    # -----------------------------------------------------------------------
+    # Text fields
+    # -----------------------------------------------------------------------
 
     airline = normalize_text(
         observation.airline
@@ -229,11 +352,10 @@ def normalize_fare_observation(
         observation.baggage_characteristics
     )
 
-    source = normalize_source(
-        observation.source
-    )
+    # -----------------------------------------------------------------------
+    # Fare components
+    # -----------------------------------------------------------------------
 
-    # Normalize fare components.
     base_fare = normalize_fare_value(
         observation.base_fare
     )
@@ -246,18 +368,34 @@ def normalize_fare_observation(
         observation.mandatory_charges
     )
 
-    # Construct comparable mandatory fare.
     comparable_fare = calculate_comparable_fare(
-        base_fare=base_fare,
-        taxes=taxes,
-        mandatory_charges=mandatory_charges,
+        base_fare=observation.base_fare,
+        taxes=observation.taxes,
+        mandatory_charges=observation.mandatory_charges,
+        total_fare=observation.total_fare,
     )
 
-    # Generate deterministic fare fingerprint.
-    fingerprint = generate_fare_fingerprint(
+    # -----------------------------------------------------------------------
+    # Booking window
+    # -----------------------------------------------------------------------
+
+    lead_days = (
+        travel_date - observation_date
+    ).days
+
+    booking_window = calculate_booking_window(
+        observation_date,
+        travel_date,
+    )
+
+    # -----------------------------------------------------------------------
+    # Fingerprint
+    # -----------------------------------------------------------------------
+
+    fingerprint = generate_fingerprint(
         origin=origin,
         destination=destination,
-        travel_date=observation.travel_date,
+        travel_date=travel_date,
         flight_number=flight_number,
         departure_time=departure_time,
         cabin_class=cabin_class,
@@ -265,10 +403,55 @@ def normalize_fare_observation(
         baggage_characteristics=baggage_characteristics,
     )
 
+    # -----------------------------------------------------------------------
+    # Quality status
+    # -----------------------------------------------------------------------
+
+    quality_status = QualityStatus.VALID
+    quality_reason = ""
+
+    raw_status = normalize_text(
+        observation.observation_status
+    )
+
+    if raw_status in {
+        "CANCELLED",
+        "SOLD OUT",
+        "SOLD_OUT",
+        "UNAVAILABLE",
+    }:
+        quality_status = QualityStatus.EXCLUDED
+        quality_reason = raw_status
+
+    elif comparable_fare is None:
+        quality_status = QualityStatus.EXCLUDED
+        quality_reason = "MISSING_FARE"
+
+    # -----------------------------------------------------------------------
+    # Metadata
+    # -----------------------------------------------------------------------
+
+    metadata = dict(
+        observation.metadata
+    )
+
+    metadata.update(
+        {
+            "canonical_source": source,
+            "lead_days": lead_days,
+            "quality_reason_code": quality_reason,
+            "observation_status": raw_status,
+        }
+    )
+
+    # -----------------------------------------------------------------------
+    # Result
+    # -----------------------------------------------------------------------
+
     return NormalizedFareObservation(
         origin=origin,
         destination=destination,
-        travel_date=observation.travel_date,
+        travel_date=travel_date,
         observation_date=observation_date,
         booking_window=booking_window,
         airline=airline,
@@ -284,7 +467,17 @@ def normalize_fare_observation(
         source=source,
         observation_timestamp=observation.observation_timestamp,
         fingerprint=fingerprint,
-        quality_status=QualityStatus.VALID,
-        quality_reason="",
-        metadata=dict(observation.metadata),
+        quality_status=quality_status,
+        quality_reason=quality_reason,
+        metadata=metadata,
+    )
+
+
+def normalize_observation(
+    observation: RawFareObservation,
+) -> NormalizedFareObservation:
+    """Backward-compatible alias."""
+
+    return normalize_fare_observation(
+        observation
     )

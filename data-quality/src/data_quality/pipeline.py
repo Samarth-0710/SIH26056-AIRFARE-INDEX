@@ -1,37 +1,20 @@
 """
-End-to-end data-quality pipeline for SIH26056.
-
-Pipeline:
-
-Raw Fare Observation
-        ↓
-Validation
-        ↓
-Normalization
-        ↓
-Duplicate Detection
-        ↓
-Outlier Detection
-        ↓
-Normalized + Quality-Controlled Observations
-
-This module coordinates the data-quality components.
-It does NOT calculate the Airfare Price Index.
+Data-quality processing pipeline for SIH26056.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Iterable
+from dataclasses import dataclass, field
+from typing import Iterable, List, Optional
 
-from .duplicates import find_duplicate_indices
+from .duplicates import mark_duplicates
 from .models import (
     NormalizedFareObservation,
     QualityStatus,
     RawFareObservation,
 )
 from .normalizer import normalize_fare_observation
-from .outliers import find_outlier_indices
+from .outliers import mark_outliers
 from .validators import classify_raw_observation
 
 
@@ -39,27 +22,23 @@ from .validators import classify_raw_observation
 class PipelineResult:
     """
     Result returned by the data-quality pipeline.
-
-    normalized_observations:
-        Successfully normalized observations, including those
-        flagged as EXCLUDED or OUTLIER.
-
-    rejected_observations:
-        Raw observations that could not be normalized because
-        required information was missing or invalid.
     """
 
-    normalized_observations: list[
+    normalized_observations: List[
         NormalizedFareObservation
-    ]
+    ] = field(default_factory=list)
 
-    rejected_observations: list[
+    rejected_observations: List[
         RawFareObservation
-    ]
+    ] = field(default_factory=list)
 
     @property
     def total_processed(self) -> int:
-        """Return the total number of raw observations processed."""
+        """
+        Return the total number of raw observations processed.
+
+        Both accepted and rejected observations are included.
+        """
 
         return (
             len(self.normalized_observations)
@@ -68,98 +47,153 @@ class PipelineResult:
 
     @property
     def valid_count(self) -> int:
-        """Return the number of observations currently marked VALID."""
+        """
+        Return the number of normalized observations currently
+        classified as VALID.
+        """
 
         return sum(
-            observation.quality_status == QualityStatus.VALID
+            1
             for observation in self.normalized_observations
+            if observation.quality_status
+            == QualityStatus.VALID
         )
 
     @property
     def excluded_count(self) -> int:
-        """Return the number of observations marked EXCLUDED."""
+        """
+        Return the number of observations excluded from processing.
 
-        return sum(
-            observation.quality_status == QualityStatus.EXCLUDED
+        This includes:
+        - rejected raw observations
+        - normalized observations later marked EXCLUDED,
+          such as exact duplicates
+        """
+
+        rejected_count = len(
+            self.rejected_observations
+        )
+
+        normalized_excluded_count = sum(
+            1
             for observation in self.normalized_observations
-        ) + len(self.rejected_observations)
+            if observation.quality_status
+            == QualityStatus.EXCLUDED
+        )
+
+        return (
+            rejected_count
+            + normalized_excluded_count
+        )
 
     @property
     def outlier_count(self) -> int:
-        """Return the number of observations marked OUTLIER."""
+        """
+        Return the number of normalized observations flagged
+        as OUTLIER.
+        """
 
         return sum(
-            observation.quality_status == QualityStatus.OUTLIER
+            1
             for observation in self.normalized_observations
+            if observation.quality_status
+            == QualityStatus.OUTLIER
         )
 
+
+# ---------------------------------------------------------------------------
+# Single observation
+# ---------------------------------------------------------------------------
 
 def process_observation(
     observation: RawFareObservation,
 ) -> tuple[
-    NormalizedFareObservation | None,
-    RawFareObservation | None,
+    Optional[NormalizedFareObservation],
+    Optional[RawFareObservation],
 ]:
     """
-    Validate and normalize one raw observation.
+    Process one raw observation.
 
     Returns:
-        (normalized_observation, None)
-            when the record can be normalized.
+
+        (normalized, None)
+            when accepted
 
         (None, raw_observation)
-            when validation fails before normalization.
+            when rejected
     """
 
     status, reason = classify_raw_observation(
         observation
     )
 
+    # Any raw observation classified as EXCLUDED is rejected by
+    # the pipeline and preserved separately.
+    #
+    # This includes:
+    # - cancelled
+    # - sold out
+    # - unavailable
+    # - missing data
+    # - invalid fare
+    # - unknown source
+    # - invalid date
     if status == QualityStatus.EXCLUDED:
+        observation.metadata[
+            "quality_status"
+        ] = status.value
+
+        observation.metadata[
+            "quality_reason"
+        ] = reason
+
         return None, observation
 
     try:
         normalized = normalize_fare_observation(
             observation
         )
-    except (ValueError, TypeError):
+
+    except (ValueError, TypeError) as error:
+        observation.metadata[
+            "quality_status"
+        ] = QualityStatus.EXCLUDED.value
+
+        observation.metadata[
+            "quality_reason"
+        ] = str(error)
+
         return None, observation
 
-    normalized.quality_status = status
-    normalized.quality_reason = reason
+    # If normalization itself produced an excluded observation,
+    # preserve it as rejected rather than passing it downstream.
+    if normalized.quality_status == QualityStatus.EXCLUDED:
+        observation.metadata[
+            "quality_status"
+        ] = normalized.quality_status.value
+
+        observation.metadata[
+            "quality_reason"
+        ] = normalized.quality_reason
+
+        return None, observation
 
     return normalized, None
 
 
-def run_pipeline(
+# ---------------------------------------------------------------------------
+# Multiple observations
+# ---------------------------------------------------------------------------
+
+def process_observations(
     observations: Iterable[RawFareObservation],
-    outlier_multiplier: float = 1.5,
 ) -> PipelineResult:
     """
-    Run the complete data-quality pipeline.
-
-    Processing order:
-
-    1. Validate raw observations
-    2. Normalize valid observations
-    3. Detect exact duplicates
-    4. Detect statistical outliers
-
-    Observations are retained and classified rather than
-    silently deleted.
+    Process multiple raw observations.
     """
 
-    normalized_observations: list[
-        NormalizedFareObservation
-    ] = []
-
-    rejected_observations: list[
-        RawFareObservation
-    ] = []
-
-    # ---------------------------------------------------------
-    # Step 1 + 2: Validation and normalization
-    # ---------------------------------------------------------
+    normalized_observations = []
+    rejected_observations = []
 
     for observation in observations:
         normalized, rejected = process_observation(
@@ -176,73 +210,49 @@ def run_pipeline(
                 rejected
             )
 
-    # ---------------------------------------------------------
-    # Step 3: Duplicate detection
-    # ---------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Duplicate detection
+    # -----------------------------------------------------------------------
 
-    duplicate_indices = find_duplicate_indices(
+    normalized_observations = mark_duplicates(
         normalized_observations
     )
 
-    for index in duplicate_indices:
-        normalized_observations[
-            index
-        ].quality_status = QualityStatus.EXCLUDED
+    # -----------------------------------------------------------------------
+    # Outlier detection
+    # -----------------------------------------------------------------------
 
-        normalized_observations[
-            index
-        ].quality_reason = (
-            "exact duplicate observation"
-        )
-
-    # ---------------------------------------------------------
-    # Step 4: Outlier detection
-    # ---------------------------------------------------------
-    #
-    # Only observations that are still VALID are considered
-    # for outlier detection.
-    #
-    # EXCLUDED observations, including duplicates, must not
-    # influence the IQR calculation.
-
-    valid_observations = [
+    # Only currently VALID observations are passed to the IQR calculation.
+    # Excluded duplicates therefore do not affect the outlier bounds.
+    valid_for_outlier_detection = [
         observation
         for observation in normalized_observations
-        if observation.quality_status == QualityStatus.VALID
+        if observation.quality_status
+        == QualityStatus.VALID
     ]
 
-    valid_indices = [
-        index
-        for index, observation in enumerate(
-            normalized_observations
-        )
-        if observation.quality_status == QualityStatus.VALID
-    ]
-
-    valid_outlier_indices = find_outlier_indices(
-        valid_observations,
-        multiplier=outlier_multiplier,
-    )
-
-    # Convert indexes from the filtered VALID list back to
-    # indexes in the original normalized observation list.
-    outlier_indices = [
-        valid_indices[index]
-        for index in valid_outlier_indices
-    ]
-
-    for index in outlier_indices:
-        normalized_observations[
-            index
-        ].quality_status = QualityStatus.OUTLIER
-
-        normalized_observations[
-            index
-        ].quality_reason = (
-            "comparable fare flagged as an IQR outlier"
+    if valid_for_outlier_detection:
+        mark_outliers(
+            valid_for_outlier_detection
         )
 
     return PipelineResult(
         normalized_observations=normalized_observations,
         rejected_observations=rejected_observations,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public pipeline API
+# ---------------------------------------------------------------------------
+
+def run_pipeline(
+    observations: Iterable[RawFareObservation],
+) -> PipelineResult:
+    """
+    Run the complete data-quality pipeline.
+    """
+
+    return process_observations(
+        observations
     )

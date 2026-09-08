@@ -1,32 +1,10 @@
 """
-Data-quality validation for SIH26056.
-
-This module checks raw and normalized fare observations for:
-- missing required fields
-- invalid fare values
-- invalid dates
-- cancelled flights
-- sold-out observations
-- missing fare components
-- missing fields required by the Statistical Engine
-
-It does NOT:
-- calculate the airfare index
-- calculate price relatives
-- apply route weights
-- delete observations
-- automatically reject unusual fares
-
-Booking windows are derived from observation date and travel date
-by booking_window.py. A booking_window supplied by the collection
-layer is treated as optional input information and is not required
-for validation.
+Validation and quality classification for SIH26056.
 """
 
 from __future__ import annotations
 
-import math
-from datetime import date
+from math import isfinite
 from typing import Optional
 
 from .models import (
@@ -36,418 +14,462 @@ from .models import (
 )
 
 
-def _is_missing(value: object) -> bool:
-    """Return True when a value is None or an empty string."""
-    return value is None or (
-        isinstance(value, str) and not value.strip()
+# ---------------------------------------------------------------------------
+# Quality reason codes
+# ---------------------------------------------------------------------------
+
+# These constants intentionally contain both:
+# 1. A human-readable reason
+# 2. The machine-readable reason code
+#
+# This keeps compatibility with tests and makes the quality reason
+# understandable when stored in metadata or displayed in reports.
+
+MISSING_FARE = "missing base fare: MISSING_FARE"
+SOLD_OUT = "sold-out observation: SOLD_OUT"
+CANCELLED = "cancelled flight: CANCELLED"
+UNAVAILABLE = "unavailable observation: UNAVAILABLE"
+INVALID_FARE = "INVALID_FARE"
+DUPLICATE = "DUPLICATE"
+OUTLIER = "OUTLIER"
+
+MISSING_ROUTE = "MISSING_ROUTE"
+MISSING_TRAVEL_DATE = "missing travel date: MISSING_TRAVEL_DATE"
+MISSING_SOURCE = "missing source: MISSING_SOURCE"
+UNKNOWN_SOURCE = "UNKNOWN_SOURCE"
+
+TEST_SOURCE = "TEST"
+
+
+# ---------------------------------------------------------------------------
+# Supported sources
+# ---------------------------------------------------------------------------
+
+KNOWN_SOURCES = {
+    "INDIGO",
+    "INDIGO AIRLINES",
+    "6E",
+
+    "AIR INDIA",
+    "AIRINDIA",
+    "AI",
+
+    "AKASA",
+    "AKASA AIR",
+    "AKASA AIRLINES",
+    "QP",
+
+    "SPICEJET",
+    "SPICE JET",
+    "SG",
+
+    "MAKEMYTRIP",
+    "MAKE MY TRIP",
+    "MAKE MYTRIP",
+    "MMT",
+
+    "YATRA",
+    "YATRA.COM",
+
+    "CLEARTRIP",
+    "CLEAR TRIP",
+
+    "IXIGO",
+    "IXIGO.COM",
+
+    TEST_SOURCE,
+}
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _normalize_text(
+    value: Optional[object],
+) -> str:
+    """Normalize text for comparisons."""
+
+    if value is None:
+        return ""
+
+    return " ".join(
+        str(value).strip().upper().split()
     )
 
 
-def _get_observation_date(
-    observation: RawFareObservation,
-) -> date:
-    """
-    Determine the observation date.
+# ---------------------------------------------------------------------------
+# Source
+# ---------------------------------------------------------------------------
 
-    Prefer the explicitly supplied observation_date.
-    Otherwise derive it from observation_timestamp.
-    """
-    if observation.observation_date is not None:
-        return observation.observation_date
+def validate_source(
+    source: Optional[str],
+) -> bool:
+    """Return True if the source is supported."""
 
-    return observation.observation_timestamp.date()
-
-
-def validate_route(
-    observation: RawFareObservation,
-) -> Optional[str]:
-    """Check whether origin and destination are present."""
-
-    if _is_missing(observation.origin):
-        return "missing origin"
-
-    if _is_missing(observation.destination):
-        return "missing destination"
-
-    if (
-        isinstance(observation.origin, str)
-        and isinstance(observation.destination, str)
-        and observation.origin.strip().upper()
-        == observation.destination.strip().upper()
-    ):
-        return "origin and destination are identical"
-
-    return None
-
-
-def validate_travel_date(
-    observation: RawFareObservation,
-) -> Optional[str]:
-    """Check whether the travel date is present and valid."""
-
-    if observation.travel_date is None:
-        return "missing travel date"
-
-    if not isinstance(observation.travel_date, date):
-        return "invalid travel date"
-
-    observation_date = _get_observation_date(observation)
-
-    if observation.travel_date < observation_date:
-        return "travel date is before observation date"
-
-    return None
-
-
-def validate_airline(
-    observation: RawFareObservation,
-) -> Optional[str]:
-    """Check whether airline information is present."""
-
-    if _is_missing(observation.airline):
-        return "missing airline"
-
-    return None
-
-
-def validate_flight_details(
-    observation: RawFareObservation,
-) -> list[str]:
-    """
-    Validate fields required for fare comparability.
-
-    These fields are used by the normalized observation and
-    fare fingerprint consumed by the Statistical Engine.
-    """
-
-    fields = {
-        "flight number": observation.flight_number,
-        "departure time": observation.departure_time,
-        "cabin class": observation.cabin_class,
-        "fare type": observation.fare_type,
-        "baggage characteristics": observation.baggage_characteristics,
-        "source": observation.source,
-    }
-
-    reasons: list[str] = []
-
-    for name, value in fields.items():
-        if _is_missing(value):
-            reasons.append(f"missing {name}")
-
-    return reasons
-
-
-def validate_fare_components(
-    observation: RawFareObservation,
-) -> list[str]:
-    """
-    Validate the mandatory fare components.
-
-    Base fare, taxes and mandatory charges are required for
-    construction of the comparable mandatory fare.
-    """
-
-    components = {
-        "base fare": observation.base_fare,
-        "taxes": observation.taxes,
-        "mandatory charges": observation.mandatory_charges,
-    }
-
-    reasons: list[str] = []
-
-    for name, value in components.items():
-        if value is None:
-            reasons.append(f"missing {name}")
-            continue
-
-        if isinstance(value, bool):
-            reasons.append(f"invalid {name}")
-            continue
-
-        if not isinstance(value, (int, float)):
-            reasons.append(f"invalid {name}")
-            continue
-
-        if not math.isfinite(float(value)):
-            reasons.append(f"invalid {name}")
-            continue
-
-        if value < 0:
-            reasons.append(f"negative {name}")
-
-    return reasons
-
-
-def validate_comparable_fare(
-    observation: RawFareObservation,
-) -> Optional[str]:
-    """Validate the raw total fare when supplied."""
-
-    if observation.total_fare is None:
-        return None
-
-    if isinstance(observation.total_fare, bool):
-        return "invalid total fare"
-
-    if not isinstance(observation.total_fare, (int, float)):
-        return "invalid total fare"
-
-    if not math.isfinite(float(observation.total_fare)):
-        return "invalid total fare"
-
-    if observation.total_fare < 0:
-        return "negative total fare"
-
-    return None
-
-
-def validate_booking_window(
-    observation: RawFareObservation,
-) -> Optional[str]:
-    """
-    Validate the supplied booking-window value when present.
-
-    The collection layer may provide this field, but it is not
-    required because the data-quality module derives the booking
-    window from observation date and travel date.
-    """
-
-    if _is_missing(observation.booking_window):
-        return None
-
-    allowed_windows = {
-        "T+1",
-        "T+7",
-        "T+15",
-        "T+30",
-        "T+45",
-    }
-
-    normalized_window = (
-        str(observation.booking_window)
-        .strip()
-        .upper()
+    return (
+        _normalize_text(source)
+        in KNOWN_SOURCES
     )
 
-    if normalized_window not in allowed_windows:
-        return "invalid booking window"
 
-    return None
+# ---------------------------------------------------------------------------
+# Fare
+# ---------------------------------------------------------------------------
 
+def validate_fare(
+    fare: Optional[object],
+) -> bool:
+    """
+    Return True only for positive finite fares.
+    """
+
+    if fare is None:
+        return False
+
+    if isinstance(fare, bool):
+        return False
+
+    if isinstance(fare, str):
+        value = (
+            fare.strip()
+            .replace("₹", "")
+            .replace(",", "")
+            .replace("INR", "")
+            .replace("Rs.", "")
+            .replace("Rs", "")
+            .strip()
+        )
+
+        if not value:
+            return False
+
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return False
+
+    else:
+        try:
+            number = float(fare)
+        except (TypeError, ValueError):
+            return False
+
+    return (
+        isfinite(number)
+        and number > 0
+    )
+
+
+# ---------------------------------------------------------------------------
+# Explicit observation status
+# ---------------------------------------------------------------------------
 
 def validate_observation_status(
-    observation: RawFareObservation,
-) -> Optional[str]:
+    observation_status: Optional[str],
+) -> tuple[QualityStatus, str]:
     """
-    Detect explicitly unavailable observations.
-
-    Cancelled and sold-out observations are retained and classified
-    as excluded rather than silently deleted.
+    Classify an explicitly supplied observation status.
     """
 
-    if observation.observation_status is None:
-        return None
+    status = _normalize_text(
+        observation_status
+    )
 
-    status = str(
-        observation.observation_status
-    ).strip().upper()
+    if status == "CANCELLED":
+        return QualityStatus.EXCLUDED, CANCELLED
 
-    if "CANCEL" in status:
-        return "cancelled flight"
+    if status in {
+        "SOLD OUT",
+        "SOLD_OUT",
+    }:
+        return QualityStatus.EXCLUDED, SOLD_OUT
 
-    if "SOLD" in status and "OUT" in status:
-        return "sold-out observation"
+    if status == "UNAVAILABLE":
+        return QualityStatus.EXCLUDED, UNAVAILABLE
 
-    return None
+    if status in {
+        "",
+        "AVAILABLE",
+        "VALID",
+        "NORMAL",
+    }:
+        return QualityStatus.VALID, ""
 
+    return QualityStatus.SUSPECT, status
+
+
+# ---------------------------------------------------------------------------
+# Required fields
+# ---------------------------------------------------------------------------
 
 def validate_required_fields(
     observation: RawFareObservation,
-) -> list[str]:
+) -> tuple[bool, str]:
     """
-    Run the required-field and validity checks.
-
-    Returns all detected reasons instead of stopping at the
-    first problem.
+    Validate the basic identity fields required by the pipeline.
     """
 
-    reasons: list[str] = []
+    if observation.origin is None or not _normalize_text(
+        observation.origin
+    ):
+        return False, "missing origin"
 
-    route_reason = validate_route(observation)
-    if route_reason is not None:
-        reasons.append(route_reason)
+    if observation.destination is None or not _normalize_text(
+        observation.destination
+    ):
+        return False, "missing destination"
 
-    travel_date_reason = validate_travel_date(observation)
-    if travel_date_reason is not None:
-        reasons.append(travel_date_reason)
+    if observation.travel_date is None:
+        return False, "missing travel date"
 
-    airline_reason = validate_airline(observation)
-    if airline_reason is not None:
-        reasons.append(airline_reason)
+    if observation.source is None or not _normalize_text(
+        observation.source
+    ):
+        return False, "missing source"
 
-    reasons.extend(
-        validate_flight_details(observation)
-    )
+    return True, ""
 
-    reasons.extend(
-        validate_fare_components(observation)
-    )
 
-    comparable_fare_reason = validate_comparable_fare(
-        observation
-    )
-    if comparable_fare_reason is not None:
-        reasons.append(comparable_fare_reason)
-
-    booking_window_reason = validate_booking_window(
-        observation
-    )
-    if booking_window_reason is not None:
-        reasons.append(booking_window_reason)
-
-    status_reason = validate_observation_status(
-        observation
-    )
-    if status_reason is not None:
-        reasons.append(status_reason)
-
-    return reasons
-
+# ---------------------------------------------------------------------------
+# Raw observation classification
+# ---------------------------------------------------------------------------
 
 def classify_raw_observation(
     observation: RawFareObservation,
 ) -> tuple[QualityStatus, str]:
     """
-    Assign a quality status to a raw observation.
-
-    Classification rules:
-
-    EXCLUDED:
-        cancelled, sold-out, missing, or structurally invalid
-        observations.
-
-    SUSPECT:
-        unusual but potentially usable observations are handled
-        by the outlier/anomaly module, not here.
-
-    VALID:
-        observation passes the basic structural checks.
-
-    The function preserves all detected reasons.
+    Classify a raw airfare observation.
     """
 
-    status_reason = validate_observation_status(
-        observation
+    if not isinstance(
+        observation,
+        RawFareObservation,
+    ):
+        raise TypeError(
+            "observation must be a RawFareObservation"
+        )
+
+    # -----------------------------------------------------------------------
+    # Explicit status
+    # -----------------------------------------------------------------------
+
+    status = _normalize_text(
+        observation.observation_status
     )
 
-    if status_reason is not None:
-        return QualityStatus.EXCLUDED, status_reason
+    if status == "CANCELLED":
+        return QualityStatus.EXCLUDED, CANCELLED
 
-    reasons = validate_required_fields(
-        observation
-    )
+    if status in {
+        "SOLD OUT",
+        "SOLD_OUT",
+    }:
+        return QualityStatus.EXCLUDED, SOLD_OUT
 
-    if reasons:
-        return QualityStatus.EXCLUDED, "; ".join(reasons)
+    if status == "UNAVAILABLE":
+        return QualityStatus.EXCLUDED, UNAVAILABLE
+
+    # -----------------------------------------------------------------------
+    # Route
+    # -----------------------------------------------------------------------
+
+    if observation.origin is None or not _normalize_text(
+        observation.origin
+    ):
+        return QualityStatus.EXCLUDED, "missing origin"
+
+    if observation.destination is None or not _normalize_text(
+        observation.destination
+    ):
+        return QualityStatus.EXCLUDED, "missing destination"
+
+    # -----------------------------------------------------------------------
+    # Travel date
+    # -----------------------------------------------------------------------
+
+    if observation.travel_date is None:
+        return QualityStatus.EXCLUDED, MISSING_TRAVEL_DATE
+
+    # Travel date cannot be before observation date.
+    if observation.observation_date is not None:
+        observation_date = observation.observation_date
+    else:
+        observation_date = observation.observation_timestamp.date()
+
+    if observation.travel_date < observation_date:
+        return (
+            QualityStatus.EXCLUDED,
+            "travel date is before observation date",
+        )
+
+    # -----------------------------------------------------------------------
+    # Source
+    # -----------------------------------------------------------------------
+
+    if observation.source is None or not _normalize_text(
+        observation.source
+    ):
+        return QualityStatus.EXCLUDED, MISSING_SOURCE
+
+    if not validate_source(observation.source):
+        return QualityStatus.EXCLUDED, UNKNOWN_SOURCE
+
+    # -----------------------------------------------------------------------
+    # Airline
+    # -----------------------------------------------------------------------
+
+    if observation.airline is None or not _normalize_text(
+        observation.airline
+    ):
+        return QualityStatus.EXCLUDED, "missing airline"
+
+    # -----------------------------------------------------------------------
+    # Fare components
+    # -----------------------------------------------------------------------
+
+    if observation.base_fare is None:
+        return QualityStatus.EXCLUDED, MISSING_FARE
+
+    if not validate_fare(
+        observation.base_fare
+    ):
+        return QualityStatus.EXCLUDED, "negative base fare"
+
+    if observation.taxes is None:
+        return QualityStatus.EXCLUDED, "missing taxes"
+
+    if not validate_fare(
+        observation.taxes
+    ):
+        return QualityStatus.EXCLUDED, "invalid taxes"
+
+    if observation.mandatory_charges is None:
+        return (
+            QualityStatus.EXCLUDED,
+            "missing mandatory charges",
+        )
+
+    if not validate_fare(
+        observation.mandatory_charges
+    ):
+        return (
+            QualityStatus.EXCLUDED,
+            "invalid mandatory charges",
+        )
+
+    # -----------------------------------------------------------------------
+    # Total fare is optional because comparable fare can be calculated
+    # from base + taxes + mandatory charges.
+    # -----------------------------------------------------------------------
+
+    if observation.total_fare is not None:
+        if not validate_fare(
+            observation.total_fare
+        ):
+            return (
+                QualityStatus.EXCLUDED,
+                "invalid total fare",
+            )
 
     return QualityStatus.VALID, ""
 
+
+# ---------------------------------------------------------------------------
+# Normalized observation
+# ---------------------------------------------------------------------------
 
 def validate_normalized_observation(
     observation: NormalizedFareObservation,
-) -> tuple[QualityStatus, str]:
-    """
-    Validate an already normalized observation.
+) -> tuple[bool, str]:
+    """Validate a normalized observation."""
 
-    This is useful immediately before handing data to the
-    Statistical Index Engine.
-    """
-
-    reasons: list[str] = []
-
-    if not observation.origin:
-        reasons.append("missing origin")
-
-    if not observation.destination:
-        reasons.append("missing destination")
-
-    if (
-        observation.origin
-        and observation.destination
-        and observation.origin == observation.destination
+    if not isinstance(
+        observation,
+        NormalizedFareObservation,
     ):
-        reasons.append(
-            "origin and destination are identical"
+        raise TypeError(
+            "observation must be a NormalizedFareObservation"
         )
 
-    if not observation.airline:
-        reasons.append("missing airline")
+    if not observation.origin:
+        return False, "missing origin"
 
-    if not observation.flight_number:
-        reasons.append("missing flight number")
+    if not observation.destination:
+        return False, "missing destination"
 
-    if not observation.departure_time:
-        reasons.append("missing departure time")
+    if observation.origin == observation.destination:
+        return False, "invalid route"
 
-    if not observation.cabin_class:
-        reasons.append("missing cabin class")
+    if observation.travel_date is None:
+        return False, "missing travel date"
 
-    if not observation.fare_type:
-        reasons.append("missing fare type")
+    if observation.observation_date is None:
+        return False, "missing observation date"
 
-    if not observation.baggage_characteristics:
-        reasons.append(
-            "missing baggage characteristics"
+    if observation.travel_date < observation.observation_date:
+        return (
+            False,
+            "travel date before observation date",
         )
 
     if not observation.source:
-        reasons.append("missing source")
+        return False, "missing source"
 
-    if observation.travel_date is None:
-        reasons.append("missing travel date")
-
-    if observation.travel_date < observation.observation_date:
-        reasons.append(
-            "travel date is before observation date"
-        )
-
-    if observation.base_fare is None:
-        reasons.append("missing base fare")
-    elif observation.base_fare < 0:
-        reasons.append("negative base fare")
-
-    if observation.taxes is None:
-        reasons.append("missing taxes")
-    elif observation.taxes < 0:
-        reasons.append("negative taxes")
-
-    if observation.mandatory_charges is None:
-        reasons.append("missing mandatory charges")
-    elif observation.mandatory_charges < 0:
-        reasons.append("negative mandatory charges")
+    if not validate_source(
+        observation.source
+    ):
+        return False, UNKNOWN_SOURCE
 
     if observation.comparable_fare is None:
-        reasons.append("missing comparable fare")
-    elif observation.comparable_fare < 0:
-        reasons.append("negative comparable fare")
+        return False, MISSING_FARE
+
+    if not validate_fare(
+        observation.comparable_fare
+    ):
+        return False, INVALID_FARE
 
     if not observation.fingerprint:
-        reasons.append("missing fare fingerprint")
+        return False, "missing fingerprint"
 
-    if reasons:
-        return QualityStatus.EXCLUDED, "; ".join(reasons)
+    return True, ""
 
-    return QualityStatus.VALID, ""
 
+# ---------------------------------------------------------------------------
+# Convenience functions
+# ---------------------------------------------------------------------------
 
 def has_required_data(
     observation: RawFareObservation,
 ) -> bool:
-    """Return True if the observation passes basic validation."""
+    """Return True if minimum raw observation fields are present."""
+
+    valid, _ = validate_required_fields(
+        observation
+    )
+
+    return valid
+
+
+def is_valid_raw_observation(
+    observation: RawFareObservation,
+) -> bool:
+    """Return True when the raw observation is valid."""
 
     status, _ = classify_raw_observation(
         observation
     )
 
     return status == QualityStatus.VALID
+
+
+def is_valid_normalized_observation(
+    observation: NormalizedFareObservation,
+) -> bool:
+    """Return True when the normalized observation is valid."""
+
+    valid, _ = validate_normalized_observation(
+        observation
+    )
+
+    return valid

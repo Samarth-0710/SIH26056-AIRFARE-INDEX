@@ -2,8 +2,8 @@
 
 **Owner:** Hindu
 
-The Data Quality module prepares airfare observations for the Statistical
-Index Engine.
+The Data Quality module prepares airfare observations for the
+Statistical Index Engine.
 
 ## Responsibilities
 
@@ -25,6 +25,7 @@ Index Engine.
 
 ## Pipeline
 
+```text
 Raw Fare Observation
         |
         v

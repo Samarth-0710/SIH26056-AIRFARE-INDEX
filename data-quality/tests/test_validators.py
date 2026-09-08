@@ -6,7 +6,110 @@ from src.data_quality.validators import (
     has_required_data,
     validate_normalized_observation,
 )
+from datetime import date, datetime
 
+from data_quality.models import QualityStatus, RawFareObservation
+from data_quality.validators import (
+    CANCELLED,
+    MISSING_FARE,
+    MISSING_SOURCE,
+    SOLD_OUT,
+    UNKNOWN_SOURCE,
+    UNAVAILABLE,
+    classify_raw_observation,
+)
+
+
+def make_raw_observation(**overrides):
+    data = {
+        "observation_timestamp": datetime(
+            2026, 9, 1, 10, 0
+        ),
+        "origin": "DEL",
+        "destination": "BOM",
+        "travel_date": date(2026, 9, 8),
+        "observation_date": date(2026, 9, 1),
+        "airline": "IndiGo",
+        "flight_number": "6E123",
+        "departure_time": "10:30",
+        "cabin_class": "Economy",
+        "fare_type": "Regular",
+        "baggage_characteristics": "15KG",
+        "base_fare": 4500,
+        "taxes": 700,
+        "mandatory_charges": 100,
+        "source": "MMT",
+    }
+
+    data.update(overrides)
+
+    return RawFareObservation(**data)
+
+
+def test_sold_out_is_excluded():
+    status, reason = classify_raw_observation(
+        make_raw_observation(
+            observation_status="SOLD OUT"
+        )
+    )
+
+    assert status == QualityStatus.EXCLUDED
+    assert reason == SOLD_OUT
+
+
+def test_cancelled_is_excluded():
+    status, reason = classify_raw_observation(
+        make_raw_observation(
+            observation_status="CANCELLED"
+        )
+    )
+
+    assert status == QualityStatus.EXCLUDED
+    assert reason == CANCELLED
+
+
+def test_unavailable_is_excluded():
+    status, reason = classify_raw_observation(
+        make_raw_observation(
+            observation_status="UNAVAILABLE"
+        )
+    )
+
+    assert status == QualityStatus.EXCLUDED
+    assert reason == UNAVAILABLE
+
+
+def test_missing_fare_is_excluded():
+    status, reason = classify_raw_observation(
+        make_raw_observation(
+            base_fare=None
+        )
+    )
+
+    assert status == QualityStatus.EXCLUDED
+    assert MISSING_FARE in reason
+
+
+def test_missing_source_is_excluded():
+    status, reason = classify_raw_observation(
+        make_raw_observation(
+            source=None
+        )
+    )
+
+    assert status == QualityStatus.EXCLUDED
+    assert MISSING_SOURCE in reason
+
+
+def test_unknown_source_is_excluded():
+    status, reason = classify_raw_observation(
+        make_raw_observation(
+            source="UNKNOWN-FLIGHT-SITE"
+        )
+    )
+
+    assert status == QualityStatus.EXCLUDED
+    assert UNKNOWN_SOURCE in reason
 
 def make_valid_observation():
     return RawFareObservation(
