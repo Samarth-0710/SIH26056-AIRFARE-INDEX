@@ -90,6 +90,19 @@ export interface SourceHealth {
   coverage_percent: number;
 }
 
+export interface QualitySummary {
+  total_observations: number;
+  valid_observations: number;
+  suspect_observations: number;
+  excluded_observations: number;
+  outlier_count: number;
+  route_coverage: number;
+  source_coverage: number;
+  freshness_minutes: number;
+  status: string;
+  source_health: SourceHealth[];
+}
+
 export interface SimulationRequest {
   route: string;
   shock_percent: number;
@@ -120,6 +133,62 @@ export interface ValidationHistoryPoint {
   reference_index: number | null;
 }
 
+export interface MoSPIReferenceDetails {
+  name: string;
+  source?: string;
+  item: string;
+  item_code: string;
+  base_year: number;
+  series?: string;
+  frequency: string;
+  state: string;
+  sector: string;
+  connected: boolean;
+  records: number;
+  first_date?: string | null;
+  latest_date?: string | null;
+  latest_cpi?: number | null;
+}
+
+export interface AlignmentDetails {
+  overlapping_months: number;
+  status: string;
+  aligned_months: string[];
+}
+
+export interface ComparisonDetails {
+  reference_month?: string | null;
+  our_monthly_index?: number | null;
+  mospi_monthly_index?: number | null;
+  absolute_difference?: number | null;
+  percentage_difference?: number | null;
+  rebasing_method?: string;
+  our_rebased_index?: number | null;
+  mospi_rebased_index?: number | null;
+}
+
+export interface MovementDetails {
+  our_mom_change?: number | null;
+  mospi_mom_change?: number | null;
+  absolute_difference?: number | null;
+}
+
+export interface CorrelationDetails {
+  value?: number | null;
+  status: string;
+  minimum_required_months?: number;
+  description?: string;
+}
+
+export interface MonthlySeriesPoint {
+  month: string;
+  our_monthly_index?: number | null;
+  mospi_cpi?: number | null;
+  our_rebased?: number | null;
+  mospi_rebased?: number | null;
+  status: string;
+}
+
 export interface ValidationResult {
   period: string;
   reference_dataset: string;
@@ -128,6 +197,12 @@ export interface ValidationResult {
   is_reference_connected: boolean;
   metrics: ValidationMetric[];
   history: ValidationHistoryPoint[];
+  reference_dataset_details?: MoSPIReferenceDetails;
+  alignment?: AlignmentDetails;
+  comparison?: ComparisonDetails;
+  movement?: MovementDetails;
+  correlation?: CorrelationDetails;
+  monthly_series?: MonthlySeriesPoint[];
 }
 
 export interface ConfidenceMetrics {
@@ -138,9 +213,18 @@ export interface ConfidenceMetrics {
   freshness: 'Excellent' | 'Good' | 'Stale' | 'Outdated';
 }
 
+export interface LiveSourceStatus {
+  source: string;
+  is_configured: boolean;
+  is_connected: boolean;
+  status: 'CONNECTED' | 'AVAILABLE' | 'NOT_CONFIGURED' | 'DEGRADED' | 'ERROR' | string;
+  message: string;
+}
+
 export interface DataProviderStatus {
   isDemo: boolean;
   isLive: boolean;
   lastChecked: string;
   error?: string;
+  liveSource?: LiveSourceStatus;
 }

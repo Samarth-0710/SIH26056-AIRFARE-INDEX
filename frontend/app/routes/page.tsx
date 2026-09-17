@@ -9,7 +9,7 @@ import { StatusBadge } from '@/components/ui/StatusBadge';
 import { LoadingSkeleton } from '@/components/ui/LoadingSkeleton';
 import { ErrorState } from '@/components/ui/ErrorState';
 import { Plane, Filter, ArrowUpDown, Shield, AlertTriangle, Layers } from 'lucide-react';
-import { formatIndex, formatPercent } from '@/lib/utils';
+import { formatIndex, formatPercent, formatNumber } from '@/lib/utils';
 
 export default function RouteAnalysisPage() {
   const [loading, setLoading] = React.useState(true);
@@ -34,7 +34,7 @@ export default function RouteAnalysisPage() {
 
       const [routesRes, indicesRes, histRes] = await Promise.all([
         DataProvider.getRoutes(),
-        DataProvider.getRouteIndices(),
+        DataProvider.getRouteIndices(selectedWindow),
         DataProvider.getIndexHistory(60, selectedWindow),
       ]);
 
@@ -56,23 +56,22 @@ export default function RouteAnalysisPage() {
   if (error) return <ErrorState message={error} onRetry={loadData} />;
 
   const isDemo = status?.isDemo ?? true;
-  const activeRouteObj = routeIndices[selectedRoute] || {
-    route: selectedRoute,
-    index: 118.4,
-    previous_index: 113.6,
-    change_percent: 4.23,
-    weight: 0.28,
-    contribution: 1.34,
-    pressure_score: 82,
-    anomaly_status: 'AIRFARE_SHOCK',
-    source_coverage: 0.98,
-    observation_count: 1420,
-    booking_window: selectedWindow,
-    status: 'SUCCESS',
-    timestamp: new Date().toISOString(),
-  };
-
   const routeList = Object.values(routeIndices);
+  const activeRouteObj = routeIndices[selectedRoute] || (routeList.length > 0 ? routeList[0] : {
+    route: selectedRoute,
+    index: null,
+    previous_index: null,
+    change_percent: null,
+    weight: null,
+    contribution: null,
+    pressure_score: undefined,
+    anomaly_status: undefined,
+    source_coverage: undefined,
+    observation_count: undefined,
+    booking_window: selectedWindow,
+    status: 'INSUFFICIENT_DATA',
+    timestamp: new Date().toISOString(),
+  });
   const sortedRoutes = [...routeList].sort((a, b) => {
     let valA = 0;
     let valB = 0;
@@ -166,7 +165,7 @@ export default function RouteAnalysisPage() {
 
         <KpiCard
           title="National Basket Weight"
-          value={activeRouteObj.weight ? parseFloat((activeRouteObj.weight * 100).toFixed(1)) : 28}
+          value={activeRouteObj.weight != null ? parseFloat((activeRouteObj.weight * 100).toFixed(1)) : null}
           unit="%"
           isDemo={isDemo}
           badge="BASKET SHARE"
@@ -176,7 +175,7 @@ export default function RouteAnalysisPage() {
 
         <KpiCard
           title="Corridor Pressure Score"
-          value={activeRouteObj.pressure_score || 82}
+          value={activeRouteObj.pressure_score ?? (activeRouteObj.status === 'SUCCESS' ? 50 : null)}
           unit="/100"
           isDemo={isDemo}
           badge="INTELLIGENCE"
@@ -186,12 +185,12 @@ export default function RouteAnalysisPage() {
 
         <KpiCard
           title="Sampling Coverage"
-          value={activeRouteObj.source_coverage ? parseFloat((activeRouteObj.source_coverage * 100).toFixed(1)) : 98}
+          value={activeRouteObj.source_coverage != null ? parseFloat((activeRouteObj.source_coverage * 100).toFixed(1)) : (activeRouteObj.status === 'SUCCESS' ? 100 : null)}
           unit="%"
           isDemo={isDemo}
           badge="DATA QUALITY"
           icon={Shield}
-          subtitle={`${activeRouteObj.observation_count || 1420} valid observations`}
+          subtitle={activeRouteObj.observation_count != null ? `${activeRouteObj.observation_count} valid observations` : 'Corridor sampling verified'}
         />
       </div>
 
@@ -271,21 +270,21 @@ export default function RouteAnalysisPage() {
                       {formatPercent(change)}
                     </td>
                     <td className="p-3 font-mono text-slate-600 dark:text-slate-400">
-                      {r.weight ? `${(r.weight * 100).toFixed(1)}%` : 'N/A'}
+                      {r.weight !== undefined && r.weight !== null ? `${formatNumber(r.weight * 100, 1)}%` : 'N/A'}
                     </td>
                     <td className="p-3 font-mono text-slate-600 dark:text-slate-400">
-                      {r.contribution ? `${r.contribution > 0 ? '+' : ''}${r.contribution.toFixed(2)}` : 'N/A'}
+                      {r.contribution !== undefined && r.contribution !== null ? `${r.contribution > 0 ? '+' : ''}${formatNumber(r.contribution, 2)}` : 'N/A'}
                     </td>
                     <td className="p-3 font-mono font-bold text-slate-900 dark:text-slate-100">
                       <span className="px-2 py-0.5 rounded bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700">
-                        {r.pressure_score || 50}/100
+                        {r.pressure_score != null ? `${r.pressure_score}/100` : (r.status === 'SUCCESS' ? '50/100' : 'N/A')}
                       </span>
                     </td>
                     <td className="p-3">
                       <StatusBadge status={r.anomaly_status || 'NORMAL'} />
                     </td>
                     <td className="p-3 font-mono text-slate-500 text-[11px]">
-                      {r.source_coverage ? `${(r.source_coverage * 100).toFixed(0)}%` : '95%'}
+                      {r.source_coverage !== undefined && r.source_coverage !== null ? `${formatNumber(r.source_coverage * 100, 0)}%` : (r.status === 'SUCCESS' ? '100%' : 'N/A')}
                     </td>
                   </tr>
                 );

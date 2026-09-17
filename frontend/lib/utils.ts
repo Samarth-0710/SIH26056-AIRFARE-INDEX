@@ -5,16 +5,36 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
-export function formatIndex(value: number | null | undefined): string {
-  if (value === null || value === undefined) return "N/A";
-  return value.toFixed(1);
+/**
+ * Safely converts an unknown value (number, numeric string, etc.) to a JavaScript number.
+ * Returns null if the value is null, undefined, empty string, NaN, or non-finite.
+ */
+export function toNumber(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string" && value.trim() === "") return null;
+  const num = typeof value === "number" ? value : Number(value);
+  if (isNaN(num) || !isFinite(num)) return null;
+  return num;
 }
 
-export function formatPercent(value: number | null | undefined, includeSign = true): string {
-  if (value === null || value === undefined) return "N/A";
-  const formatted = Math.abs(value).toFixed(1) + "%";
+export function formatIndex(value: unknown): string {
+  const num = toNumber(value);
+  if (num === null) return "N/A";
+  return num.toFixed(1);
+}
+
+export function formatPercent(value: unknown, includeSign = true): string {
+  const num = toNumber(value);
+  if (num === null) return "N/A";
+  const formatted = Math.abs(num).toFixed(1) + "%";
   if (!includeSign) return formatted;
-  return value > 0 ? `+${formatted}` : value < 0 ? `-${formatted}` : formatted;
+  return num > 0 ? `+${formatted}` : num < 0 ? `-${formatted}` : formatted;
+}
+
+export function formatNumber(value: unknown, decimals = 2): string {
+  const num = toNumber(value);
+  if (num === null) return "N/A";
+  return num.toFixed(decimals);
 }
 
 export function formatDate(dateStr: string): string {

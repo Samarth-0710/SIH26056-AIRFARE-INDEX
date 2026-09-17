@@ -43,10 +43,24 @@ def store_index_result(db: Session, payload: IndexResultIn, route_indices: list[
 
 
 def current_index(db: Session, booking_window: str | None) -> IndexResultOut:
-    query = select(IndexResult).order_by(desc(IndexResult.observation_date), desc(IndexResult.calculation_timestamp))
     if booking_window:
-        query = query.where(IndexResult.booking_window == booking_window)
-    row = db.scalars(query).first()
+        query = select(IndexResult).where(IndexResult.booking_window == booking_window).order_by(desc(IndexResult.observation_date), desc(IndexResult.calculation_timestamp))
+        row = db.scalars(query).first()
+    else:
+        latest_date = db.scalar(select(IndexResult.observation_date).order_by(desc(IndexResult.observation_date)))
+        if latest_date is None:
+            raise HTTPException(404, "no official index result is available")
+        row = db.scalar(
+            select(IndexResult)
+            .where(IndexResult.observation_date == latest_date, IndexResult.booking_window == "T+15")
+            .order_by(desc(IndexResult.calculation_timestamp))
+        )
+        if row is None:
+            row = db.scalar(
+                select(IndexResult)
+                .where(IndexResult.observation_date == latest_date)
+                .order_by(desc(IndexResult.calculation_timestamp))
+            )
     if row is None:
         raise HTTPException(404, "no official index result is available")
     previous = db.scalars(select(IndexResult).where(IndexResult.booking_window == row.booking_window,

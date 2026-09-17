@@ -9,8 +9,8 @@ class QualityMetricIn(APIModel):
     route: str | None = None
     source: str | None = None
     observation_count: int = Field(ge=0)
-    route_coverage: Decimal | None = Field(default=None, ge=0, le=1)
-    source_coverage: Decimal | None = Field(default=None, ge=0, le=1)
+    route_coverage: float | None = Field(default=None, ge=0, le=1)
+    source_coverage: float | None = Field(default=None, ge=0, le=1)
     freshness_minutes: int | None = Field(default=None, ge=0)
     missing_observations: int = Field(default=0, ge=0)
     invalid_observations: int = Field(default=0, ge=0)

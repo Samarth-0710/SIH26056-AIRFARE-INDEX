@@ -1,11 +1,12 @@
 import os
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import requests
 from dotenv import load_dotenv
 
+from .adapters import SourceStatus
 from .booking_windows import (
     SUPPORTED_BOOKING_WINDOWS,
     get_travel_date,
@@ -14,7 +15,26 @@ from .models import RawFareRecord
 from .routes import ALL_DIRECTIONAL_ROUTES
 
 
-load_dotenv()
+from pathlib import Path
+
+
+def _load_env_config() -> None:
+    load_dotenv()
+    if not os.getenv("IGNAV_API_KEY"):
+        candidates = [
+            Path("backend/.env"),
+            Path(__file__).resolve().parents[3] / "backend" / ".env",
+            Path(__file__).resolve().parents[2] / "backend" / ".env",
+            Path("../backend/.env"),
+        ]
+        for c in candidates:
+            if c.exists():
+                load_dotenv(dotenv_path=c)
+                if os.getenv("IGNAV_API_KEY"):
+                    break
+
+
+_load_env_config()
 
 
 class IgnavFareAdapter:
@@ -40,20 +60,93 @@ class IgnavFareAdapter:
         max_retries: int = 2,
         retry_delay: int = 5,
     ):
-        self.api_key = api_key or os.getenv("IGNAV_API_KEY")
-
-        if not self.api_key:
-            raise ValueError(
-                "IGNAV_API_KEY is not configured."
-            )
-
+        if api_key is None:
+            if not os.getenv("IGNAV_API_KEY"):
+                _load_env_config()
+            self.api_key = os.getenv("IGNAV_API_KEY")
+        else:
+            self.api_key = api_key
         self.headers = {
-            "X-Api-Key": self.api_key,
+            "X-Api-Key": self.api_key or "",
             "Content-Type": "application/json",
         }
-
         self.max_retries = max_retries
         self.retry_delay = retry_delay
+        self._cached_connection_status: tuple[SourceStatus, str, float] | None = None
+
+    def get_status(self) -> SourceStatus:
+        if not self.api_key:
+            return SourceStatus.UNAVAILABLE
+        if self._cached_connection_status:
+            return self._cached_connection_status[0]
+        return SourceStatus.AVAILABLE
+
+    def check_connection(
+        self,
+        force_check: bool = False,
+        timeout: float = 6.0,
+    ) -> tuple[SourceStatus, str]:
+        """Verify real runtime connectivity to the Ignav live API.
+
+        Checks:
+        1. Whether IGNAV_API_KEY is present server-side.
+        2. Dispatches a live probe request to the Ignav API.
+        3. Caches successful/error status for 60 seconds to prevent rate-limiting.
+
+        Returns:
+            (SourceStatus, message_string)
+        """
+        if not self.api_key:
+            return (
+                SourceStatus.UNAVAILABLE,
+                "Live API credentials unconfigured; fallback active",
+            )
+
+        now = time.time()
+        if not force_check and self._cached_connection_status is not None:
+            cached_status, cached_msg, cached_time = self._cached_connection_status
+            if now - cached_time < 60.0:
+                return (cached_status, cached_msg)
+
+        probe_date = date.today() + timedelta(days=15)
+        payload = {
+            "origin": "DEL",
+            "destination": "BOM",
+            "departure_date": probe_date.isoformat(),
+            "market": "IN",
+        }
+
+        try:
+            resp = requests.post(
+                self.BASE_URL,
+                headers=self.headers,
+                json=payload,
+                timeout=timeout,
+            )
+            if resp.status_code == 200:
+                status = SourceStatus.AVAILABLE
+                message = "Live Ignav airfare data is available."
+            elif resp.status_code in (401, 403):
+                status = SourceStatus.UNAVAILABLE
+                message = "Ignav API authentication failed; credentials invalid."
+            elif resp.status_code == 429:
+                status = SourceStatus.DEGRADED
+                message = "Ignav API rate limit reached; synthetic fallback active."
+            else:
+                status = SourceStatus.DEGRADED
+                message = f"Ignav API returned status {resp.status_code}; synthetic fallback active."
+        except requests.exceptions.Timeout:
+            status = SourceStatus.DEGRADED
+            message = "Ignav API request timed out; synthetic fallback active."
+        except requests.exceptions.RequestException as exc:
+            status = SourceStatus.DEGRADED
+            message = f"Live Ignav API unreachable ({type(exc).__name__}); synthetic fallback active."
+        except Exception as exc:
+            status = SourceStatus.DEGRADED
+            message = f"Ignav live connection error: {str(exc)}"
+
+        self._cached_connection_status = (status, message, now)
+        return (status, message)
 
     def search_route(
         self,
@@ -67,6 +160,11 @@ class IgnavFareAdapter:
         Temporary API failures are retried before the
         request is considered unsuccessful.
         """
+        if not self.api_key:
+            raise ValueError(
+                "IGNAV_API_KEY is not configured. Set the IGNAV_API_KEY environment variable or pass api_key to query Ignav."
+            )
+
 
         payload = {
             "origin": origin,
@@ -113,13 +211,15 @@ class IgnavFareAdapter:
         self,
         origin: str,
         destination: str,
-        observation_date: date,
-        booking_window: int,
+        observation_date: date | None = None,
+        booking_window: int = 15,
     ) -> list[RawFareRecord]:
         """
         Collect all returned itineraries for one route
         and one booking window.
         """
+        if observation_date is None:
+            observation_date = date.today()
 
         travel_date = get_travel_date(
             observation_date,
@@ -155,12 +255,15 @@ class IgnavFareAdapter:
     def collect_all(
         self,
         observation_date: date | None = None,
+        routes: list[tuple[str, str]] | None = None,
+        booking_windows: list[int] | None = None,
     ) -> list[RawFareRecord]:
         """
         Collect all configured routes across all
         supported booking windows.
 
-        90 routes × 5 booking windows = 450 searches.
+        90 routes × 5 booking windows = 450 searches by default.
+        Pass `routes` to restrict collection to a specific subset.
 
         Failed route/window searches are skipped after
         retries so that one API failure does not stop
@@ -170,25 +273,28 @@ class IgnavFareAdapter:
         if observation_date is None:
             observation_date = date.today()
 
+        target_routes = routes if routes is not None else ALL_DIRECTIONAL_ROUTES
+        target_windows = booking_windows if booking_windows is not None else SUPPORTED_BOOKING_WINDOWS
+
         records: list[RawFareRecord] = []
 
         total_searches = (
-            len(ALL_DIRECTIONAL_ROUTES)
-            * len(SUPPORTED_BOOKING_WINDOWS)
+            len(target_routes)
+            * len(target_windows)
         )
 
         completed_searches = 0
 
-        print("\nStarting full collection:")
+        print("\nStarting collection:")
         print(
-            f"{len(ALL_DIRECTIONAL_ROUTES)} routes × "
-            f"{len(SUPPORTED_BOOKING_WINDOWS)} booking windows "
+            f"{len(target_routes)} routes × "
+            f"{len(target_windows)} booking windows "
             f"= {total_searches} searches\n"
         )
 
-        for origin, destination in ALL_DIRECTIONAL_ROUTES:
+        for origin, destination in target_routes:
 
-            for booking_window in SUPPORTED_BOOKING_WINDOWS:
+            for booking_window in target_windows:
 
                 completed_searches += 1
 

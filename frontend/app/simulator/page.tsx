@@ -8,7 +8,7 @@ import { StatusBadge } from '@/components/ui/StatusBadge';
 import { LoadingSkeleton } from '@/components/ui/LoadingSkeleton';
 import { ErrorState } from '@/components/ui/ErrorState';
 import { Sliders, AlertCircle, ArrowRight, RefreshCw, Calculator, Activity, Plane } from 'lucide-react';
-import { formatIndex, formatPercent } from '@/lib/utils';
+import { formatIndex, formatPercent, formatNumber } from '@/lib/utils';
 
 export default function SimulatorPage() {
   const [loading, setLoading] = React.useState(true);
@@ -213,7 +213,11 @@ export default function SimulatorPage() {
             <KpiCard
               title="Projected Index"
               value={simulationResult?.projected_index ?? 115.0}
-              changePercent={simulationResult ? parseFloat((((simulationResult.projected_index! - simulationResult.current_index!) / simulationResult.current_index!) * 100).toFixed(2)) : 2.1}
+              changePercent={
+                simulationResult && simulationResult.current_index && simulationResult.projected_index
+                  ? ((simulationResult.projected_index - simulationResult.current_index) / simulationResult.current_index) * 100
+                  : 2.1
+              }
               badge="PROJECTED"
               icon={Sliders}
               subtitle="National composite level"
@@ -249,7 +253,7 @@ export default function SimulatorPage() {
               <div className="flex items-center justify-between border-t border-slate-200 dark:border-slate-700 pt-2">
                 <span className="text-slate-500">National Index Impact:</span>
                 <span className="font-bold text-blue-600 dark:text-blue-400">
-                  +{simulationResult?.impact_points?.toFixed(2)} Index Points
+                  +{formatNumber(simulationResult?.impact_points, 2)} Index Points
                 </span>
               </div>
             </div>

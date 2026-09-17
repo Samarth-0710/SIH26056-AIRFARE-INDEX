@@ -13,9 +13,9 @@ class IndexResultIn(VersionMetadata):
 
 
 class IndexResultOut(APIModel):
-    index: Decimal | None
-    previous_index: Decimal | None = None
-    change_percent: Decimal | None = None
+    index: float | None
+    previous_index: float | None = None
+    change_percent: float | None = None
     timestamp: datetime
     observation_date: date
     booking_window: BookingWindow

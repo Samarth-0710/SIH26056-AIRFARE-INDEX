@@ -48,3 +48,80 @@ def test_quality_intelligence_shocks_and_simulation(client, index_payload):
 def test_simulation_never_invents_projection(client):
     response = client.post("/api/v1/simulation", json={"route":"DEL-BOM", "shock_percent":15})
     assert response.status_code in (404, 409)
+
+
+def test_new_analytical_endpoints(client, index_payload):
+    assert store_index(client, index_payload).status_code == 201
+
+    # Test route contributions endpoint
+    contrib = client.get("/api/v1/routes/contributions")
+    assert contrib.status_code == 200
+    data = contrib.json()
+    assert isinstance(data, list)
+    if len(data) > 0:
+        assert "route" in data[0]
+        assert "level_contribution" in data[0]
+
+    # Test booking windows matrix endpoint
+    matrix = client.get("/api/v1/booking-windows/matrix")
+    assert matrix.status_code == 200
+    assert isinstance(matrix.json(), list)
+
+    # Test quality summary endpoint
+    qual_summary = client.get("/api/v1/quality/summary")
+    assert qual_summary.status_code == 200
+    assert "total_observations" in qual_summary.json()
+    assert "source_health" in qual_summary.json()
+
+    # Test validation endpoint
+    val = client.get("/api/v1/validation")
+    assert val.status_code == 200
+    val_json = val.json()
+    assert "is_reference_connected" in val_json
+    assert "metrics" in val_json
+    assert "history" in val_json
+    assert isinstance(val_json["metrics"], list)
+
+
+def test_pipeline_live_status_endpoint_states(client):
+    from unittest.mock import patch
+    from data_collection.adapters import SourceStatus
+
+    # 1. Connected state
+    with patch("data_collection.ignav_adapter.IgnavFareAdapter.check_connection", return_value=(SourceStatus.AVAILABLE, "Live Ignav airfare data is available.")):
+        with patch.object(client.app, "state", create=True):
+            resp = client.get("/api/v1/pipeline/live-status")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["source"] == "IGNAV"
+            assert data["is_configured"] is True
+            assert data["is_connected"] is True
+            assert data["status"] == "CONNECTED"
+            assert "Live Ignav airfare data is available" in data["message"]
+            assert "api_key" not in data
+            assert "key" not in data
+
+    # 2. Missing credentials state
+    with patch("data_collection.ignav_adapter.IgnavFareAdapter.__init__", lambda self, **kwargs: setattr(self, "api_key", None)):
+        resp = client.get("/api/v1/pipeline/live-status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["source"] == "IGNAV"
+        assert data["is_configured"] is False
+        assert data["is_connected"] is False
+        assert data["status"] == "NOT_CONFIGURED"
+        assert "unconfigured" in data["message"]
+        assert "api_key" not in data
+
+    # 3. Degraded / Unreachable state
+    with patch("data_collection.ignav_adapter.IgnavFareAdapter.check_connection", return_value=(SourceStatus.DEGRADED, "Live Ignav API unreachable (Timeout); synthetic fallback active.")):
+        with patch("data_collection.ignav_adapter.IgnavFareAdapter.__init__", lambda self, **kwargs: setattr(self, "api_key", "mock_key")):
+            resp = client.get("/api/v1/pipeline/live-status")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["source"] == "IGNAV"
+            assert data["is_configured"] is True
+            assert data["is_connected"] is False
+            assert data["status"] == "DEGRADED"
+            assert "unreachable" in data["message"].lower() or "fallback" in data["message"].lower()
+            assert "mock_key" not in str(data)

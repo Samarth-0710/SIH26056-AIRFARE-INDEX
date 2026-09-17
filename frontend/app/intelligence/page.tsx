@@ -7,7 +7,7 @@ import { StatusBadge } from '@/components/ui/StatusBadge';
 import { LoadingSkeleton } from '@/components/ui/LoadingSkeleton';
 import { ErrorState } from '@/components/ui/ErrorState';
 import { BrainCircuit, AlertTriangle, ShieldAlert, Cpu, Activity, Info } from 'lucide-react';
-import { formatDateTime } from '@/lib/utils';
+import { formatDateTime, formatNumber } from '@/lib/utils';
 
 export default function IntelligencePage() {
   const [loading, setLoading] = React.useState(true);
@@ -36,20 +36,44 @@ export default function IntelligencePage() {
     loadData();
   }, [loadData]);
 
-  if (loading) return <LoadingSkeleton />;
-  if (error) return <ErrorState message={error} onRetry={loadData} />;
+  const dynamicRankings = React.useMemo(() => {
+    const routeScores = new Map<string, { maxScore: number; reason: string }>();
+    for (const e of events) {
+      if (e.route) {
+        const score = e.pressure_score ?? ((e.anomaly_score ?? 0) * 10 + 35);
+        const existing = routeScores.get(e.route);
+        if (!existing || score > existing.maxScore) {
+          routeScores.set(e.route, { maxScore: Math.round(score), reason: e.explanation || 'Market movement alert' });
+        }
+      }
+    }
+    if (routeScores.size === 0) {
+      return [
+        { rank: 1, route: 'DEL-BOM', score: 82, status: 'HIGH_PRESSURE', trend: 'High passenger load & yield surge' },
+        { rank: 2, route: 'DEL-BLR', score: 71, status: 'MODERATE_PRESSURE', trend: 'Tech corridor demand surge' },
+        { rank: 3, route: 'BOM-DEL', score: 64, status: 'MODERATE_PRESSURE', trend: 'Business corridor demand' },
+        { rank: 4, route: 'BLR-DEL', score: 48, status: 'NORMAL', trend: 'Baseline demand trajectory' },
+        { rank: 5, route: 'BOM-BLR', score: 35, status: 'NORMAL', trend: 'Off-peak capacity absorption' },
+      ];
+    }
+    return Array.from(routeScores.entries())
+      .sort((a, b) => b[1].maxScore - a[1].maxScore)
+      .slice(0, 5)
+      .map(([route, info], idx) => ({
+        rank: idx + 1,
+        route,
+        score: info.maxScore,
+        status: info.maxScore >= 75 ? 'HIGH_PRESSURE' : (info.maxScore >= 50 ? 'MODERATE_PRESSURE' : 'NORMAL'),
+        trend: info.reason,
+      }));
+  }, [events]);
 
   const isDemo = status?.isDemo ?? true;
   const shocks = events.filter((e) => e.event_type === 'AIRFARE_SHOCK');
   const anomalies = events.filter((e) => e.event_type === 'ANOMALY');
 
-  const pressureRankings = [
-    { rank: 1, route: 'DEL-BOM', score: 82, status: 'HIGH_PRESSURE', trend: '+4.2% acceleration' },
-    { rank: 2, route: 'DEL-BLR', score: 71, scoreChange: '+2.6%', status: 'MODERATE_PRESSURE', trend: 'Business load factor surge' },
-    { rank: 3, route: 'MAA-DEL', score: 64, scoreChange: '+2.8%', status: 'MODERATE_PRESSURE', trend: 'Slot dispersion' },
-    { rank: 4, route: 'CCU-DEL', score: 48, scoreChange: '+0.8%', status: 'NORMAL', trend: 'Stable baseline' },
-    { rank: 5, route: 'BOM-BLR', score: 35, scoreChange: '-1.4%', status: 'NORMAL', trend: 'Weekend discount cycle' },
-  ];
+  if (loading) return <LoadingSkeleton />;
+  if (error) return <ErrorState message={error} onRetry={loadData} />;
 
   return (
     <div className="space-y-6">
@@ -171,7 +195,7 @@ export default function IntelligencePage() {
                       {e.route || 'ALL'}
                     </td>
                     <td className="p-2.5 font-mono font-bold text-rose-600 dark:text-rose-400">
-                      {e.anomaly_score ? e.anomaly_score.toFixed(2) : 'N/A'}
+                      {e.anomaly_score !== undefined && e.anomaly_score !== null ? formatNumber(e.anomaly_score, 2) : 'N/A'}
                     </td>
                     <td className="p-2.5 font-mono text-[11px] font-semibold text-slate-700 dark:text-slate-300">
                       {e.event_type}
@@ -202,7 +226,7 @@ export default function IntelligencePage() {
           </div>
 
           <div className="space-y-3">
-            {pressureRankings.map((item) => (
+            {dynamicRankings.map((item) => (
               <div
                 key={item.route}
                 className="p-3 bg-slate-50 dark:bg-slate-800/50 rounded-lg border border-slate-200/80 dark:border-slate-800 flex items-center justify-between"

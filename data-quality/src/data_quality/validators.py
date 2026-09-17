@@ -78,6 +78,9 @@ KNOWN_SOURCES = {
     "IXIGO.COM",
 
     TEST_SOURCE,
+    "MOCK",
+    "DEMO",
+    "IGNAV",
 }
 
 

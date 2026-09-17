@@ -12,7 +12,7 @@ import {
   ReferenceLine,
 } from 'recharts';
 import { IndexResult } from '@/types';
-import { formatDate } from '@/lib/utils';
+import { formatDate, formatIndex, formatPercent } from '@/lib/utils';
 
 interface TrendChartProps {
   data: IndexResult[];
@@ -137,12 +137,12 @@ function CustomTooltip({ active, payload, label }: any) {
         <div className="text-slate-400 text-[11px] border-b border-slate-800 pb-1">{formatDate(label)}</div>
         <div className="flex items-center justify-between gap-4 font-bold text-sm text-blue-400">
           <span>Index:</span>
-          <span>{data.index?.toFixed(1) ?? 'N/A'}</span>
+          <span>{formatIndex(data.index)}</span>
         </div>
-        {data.change_percent !== undefined && (
+        {data.change_percent !== undefined && data.change_percent !== null && (
           <div className={`flex items-center justify-between gap-4 font-semibold ${change >= 0 ? 'text-rose-400' : 'text-emerald-400'}`}>
             <span>Daily Change:</span>
-            <span>{change >= 0 ? `+${change.toFixed(2)}%` : `${change.toFixed(2)}%`}</span>
+            <span>{formatPercent(change)}</span>
           </div>
         )}
         <div className="text-[10px] text-slate-500 pt-1">

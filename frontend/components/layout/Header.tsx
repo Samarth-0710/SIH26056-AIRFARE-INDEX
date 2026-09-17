@@ -12,6 +12,7 @@ import {
   AlertTriangle,
 } from 'lucide-react';
 import { DataProviderStatus } from '@/types';
+import { DataProvider } from '@/services/data-provider';
 import { cn } from '@/lib/utils';
 
 interface HeaderProps {
@@ -19,16 +20,32 @@ interface HeaderProps {
   onRefresh?: () => void;
 }
 
-export function Header({ status }: HeaderProps) {
+export function Header({ status: initialStatus }: HeaderProps) {
   const [theme, setTheme] = React.useState<'light' | 'dark'>('light');
   const [mounted, setMounted] = React.useState(false);
+  const [currentStatus, setCurrentStatus] = React.useState<DataProviderStatus | undefined>(initialStatus);
 
   React.useEffect(() => {
     setMounted(true);
     if (document.documentElement.classList.contains('dark')) {
       setTheme('dark');
     }
+
+    // Subscribe to DataProvider runtime status updates
+    const unsubscribe = DataProvider.subscribeStatus((newStatus) => {
+      setCurrentStatus(newStatus);
+    });
+
+    return () => {
+      unsubscribe();
+    };
   }, []);
+
+  React.useEffect(() => {
+    if (initialStatus) {
+      setCurrentStatus(initialStatus);
+    }
+  }, [initialStatus]);
 
   const toggleTheme = () => {
     const nextTheme = theme === 'light' ? 'dark' : 'light';
@@ -40,8 +57,11 @@ export function Header({ status }: HeaderProps) {
     }
   };
 
-  const isDemo = status ? status.isDemo : true;
-  const lastChecked = status?.lastChecked || new Date().toLocaleTimeString();
+  const isDemo = currentStatus ? currentStatus.isDemo : true;
+  const lastChecked = currentStatus?.lastChecked || new Date().toLocaleTimeString();
+  const isLiveApiConnected = Boolean(!isDemo && currentStatus?.liveSource?.is_connected);
+  const liveSourceStatus = currentStatus?.liveSource?.status;
+  const isDegraded = Boolean(!isDemo && (liveSourceStatus === 'DEGRADED' || liveSourceStatus === 'ERROR'));
 
   return (
     <header className="h-16 px-6 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between z-20 shrink-0 shadow-sm">
@@ -68,24 +88,31 @@ export function Header({ status }: HeaderProps) {
           <span>Updated: <span className="font-mono font-semibold">{lastChecked}</span></span>
         </div>
 
-        {/* Backend / Demo Data Status Badge */}
+        {/* Backend / Live Source Status Badge */}
         <div
           className={cn(
             'flex items-center space-x-1.5 px-3 py-1.5 rounded-full text-xs font-semibold border transition-all',
-            isDemo
-              ? 'bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-500/30'
-              : 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-500/30'
+            isLiveApiConnected
+              ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-500/30'
+              : isDegraded
+              ? 'bg-rose-500/10 text-rose-700 dark:text-rose-400 border-rose-500/30'
+              : 'bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-500/30'
           )}
         >
-          {isDemo ? (
-            <>
-              <AlertTriangle className="w-3.5 h-3.5 text-amber-500" />
-              <span>DEMO DATA</span>
-            </>
-          ) : (
+          {isLiveApiConnected ? (
             <>
               <Wifi className="w-3.5 h-3.5 text-emerald-500" />
               <span>LIVE API</span>
+            </>
+          ) : isDegraded ? (
+            <>
+              <AlertTriangle className="w-3.5 h-3.5 text-rose-500" />
+              <span>DEGRADED</span>
+            </>
+          ) : (
+            <>
+              <AlertTriangle className="w-3.5 h-3.5 text-amber-500" />
+              <span>DEMO DATA</span>
             </>
           )}
         </div>

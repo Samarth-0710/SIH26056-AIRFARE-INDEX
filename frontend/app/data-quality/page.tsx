@@ -2,7 +2,7 @@
 
 import React from 'react';
 import { DataProvider } from '@/services/data-provider';
-import { QualityMetric, SourceHealth, DataProviderStatus } from '@/types';
+import { QualityMetric, QualitySummary, SourceHealth, DataProviderStatus } from '@/types';
 import { KpiCard } from '@/components/ui/KpiCard';
 import { StatusBadge } from '@/components/ui/StatusBadge';
 import { LoadingSkeleton } from '@/components/ui/LoadingSkeleton';
@@ -17,6 +17,7 @@ export default function DataQualityPage() {
 
   const [metrics, setMetrics] = React.useState<QualityMetric[]>([]);
   const [sourceHealth, setSourceHealth] = React.useState<SourceHealth[]>([]);
+  const [summary, setSummary] = React.useState<QualitySummary | undefined>();
 
   const loadData = React.useCallback(async () => {
     setLoading(true);
@@ -28,6 +29,7 @@ export default function DataQualityPage() {
       const res = await DataProvider.getQualityMetrics();
       setMetrics(res.data);
       setSourceHealth(res.sourceHealth);
+      setSummary(res.summary);
     } catch (err: any) {
       setError(err.message || 'Failed to load data quality metrics');
     } finally {
@@ -44,10 +46,14 @@ export default function DataQualityPage() {
 
   const isDemo = status?.isDemo ?? true;
 
-  const totalObs = 68450;
-  const validObs = 65800; // 96.1%
-  const suspectObs = 1850; // 2.7%
-  const excludedObs = 800; // 1.2%
+  const totalObs = summary?.total_observations ?? 0;
+  const validObs = summary?.valid_observations ?? 0;
+  const suspectObs = summary?.suspect_observations ?? 0;
+  const excludedObs = (summary?.excluded_observations ?? 0) + (summary?.outlier_count ?? 0);
+  const freshnessMins = summary?.freshness_minutes ?? 1;
+
+  const validPct = totalObs > 0 ? ((validObs / totalObs) * 100).toFixed(1) : '0.0';
+  const filteredPct = totalObs > 0 ? (((suspectObs + excludedObs) / totalObs) * 100).toFixed(1) : '0.0';
 
   const pieData = [
     { name: 'Valid Observations', value: validObs, color: '#059669' },
@@ -98,7 +104,7 @@ export default function DataQualityPage() {
         <KpiCard
           title="Valid Cleansed Observations"
           value={validObs}
-          unit="(96.1%)"
+          unit={`(${validPct}%)`}
           isDemo={isDemo}
           badge="PASSED"
           icon={CheckCircle}
@@ -108,7 +114,7 @@ export default function DataQualityPage() {
         <KpiCard
           title="Suspect & Outlier Records"
           value={suspectObs + excludedObs}
-          unit="(3.9%)"
+          unit={`(${filteredPct}%)`}
           isDemo={isDemo}
           badge="FILTERED"
           icon={AlertTriangle}
@@ -117,7 +123,7 @@ export default function DataQualityPage() {
 
         <KpiCard
           title="Crawl Data Freshness"
-          value={8}
+          value={freshnessMins}
           unit="mins ago"
           isDemo={isDemo}
           badge="REAL-TIME"

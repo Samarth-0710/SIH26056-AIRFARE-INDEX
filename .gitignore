@@ -25,6 +25,8 @@ pnpm-debug.log*
 *.parquet
 *.jsonl
 *.log
+*.db
+*.sqlite
 data/
 artifacts/
 secrets/

@@ -1,3 +1,4 @@
+import pytest
 from datetime import date
 
 from data_collection.ignav_adapter import IgnavFareAdapter
@@ -6,6 +7,10 @@ from data_collection.booking_windows import SUPPORTED_BOOKING_WINDOWS
 
 def test_ignav_blr_del_all_booking_windows():
     adapter = IgnavFareAdapter()
+    if not adapter.api_key:
+        with pytest.raises(ValueError, match="IGNAV_API_KEY is not configured"):
+            adapter.search_route("BLR", "DEL", date.today())
+        return
 
     observation_date = date.today()
 

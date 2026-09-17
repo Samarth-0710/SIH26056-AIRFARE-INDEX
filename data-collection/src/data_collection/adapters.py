@@ -1,8 +1,15 @@
 from abc import ABC, abstractmethod
 from datetime import date
+from enum import Enum
 from typing import List
 
 from .models import RawFareRecord
+
+
+class SourceStatus(str, Enum):
+    AVAILABLE = "AVAILABLE"
+    UNAVAILABLE = "UNAVAILABLE"
+    DEGRADED = "DEGRADED"
 
 
 class SourceAdapter(ABC):
@@ -28,3 +35,7 @@ class SourceAdapter(ABC):
         downstream.
         """
         raise NotImplementedError
+
+    def get_status(self) -> SourceStatus:
+        """Return operational status of this source."""
+        return SourceStatus.AVAILABLE

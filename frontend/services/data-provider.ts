@@ -22,6 +22,7 @@ import {
   RouteContribution,
   IntelligenceEvent,
   QualityMetric,
+  QualitySummary,
   SourceHealth,
   ValidationResult,
   SimulationRequest,
@@ -29,32 +30,76 @@ import {
   ConfidenceMetrics,
   BookingWindow,
   DataProviderStatus,
+  LiveSourceStatus,
 } from '@/types';
 
 export class DataProvider {
-  private static isLiveCache: boolean | null = null;
+  private static statusCache: DataProviderStatus | null = null;
   private static lastCheckTime = 0;
+  private static statusListeners: Array<(status: DataProviderStatus) => void> = [];
 
-  static async getStatus(): Promise<DataProviderStatus> {
+  static subscribeStatus(listener: (status: DataProviderStatus) => void): () => void {
+    this.statusListeners.push(listener);
+    if (this.statusCache) {
+      listener(this.statusCache);
+    }
+    return () => {
+      this.statusListeners = this.statusListeners.filter((l) => l !== listener);
+    };
+  }
+
+  private static notifyStatusListeners(status: DataProviderStatus) {
+    for (const listener of this.statusListeners) {
+      try {
+        listener(status);
+      } catch (err) {
+        console.error('Error in status listener', err);
+      }
+    }
+  }
+
+  static async getStatus(forceRefresh = false): Promise<DataProviderStatus> {
     const now = Date.now();
-    // Cache live status for 15 seconds to avoid spamming /health
-    if (this.isLiveCache !== null && now - this.lastCheckTime < 15000) {
-      return {
-        isDemo: !this.isLiveCache,
-        isLive: this.isLiveCache,
-        lastChecked: new Date(this.lastCheckTime).toLocaleTimeString(),
-      };
+    // Cache live status for 15 seconds to avoid spamming /health and /live-status
+    if (!forceRefresh && this.statusCache !== null && now - this.lastCheckTime < 15000) {
+      return this.statusCache;
     }
 
     const isHealthy = await apiService.checkHealth();
-    this.isLiveCache = isHealthy;
-    this.lastCheckTime = now;
+    let liveSource: LiveSourceStatus = {
+      source: 'IGNAV',
+      is_configured: false,
+      is_connected: false,
+      status: 'NOT_CONFIGURED',
+      message: 'Live API credentials unconfigured; fallback active',
+    };
 
-    return {
+    if (isHealthy) {
+      try {
+        liveSource = await apiService.getLiveSourceStatus();
+      } catch (err: any) {
+        liveSource = {
+          source: 'IGNAV',
+          is_configured: false,
+          is_connected: false,
+          status: 'DEGRADED',
+          message: 'Failed to reach live source status endpoint; fallback active',
+        };
+      }
+    }
+
+    const statusResult: DataProviderStatus = {
       isDemo: !isHealthy,
       isLive: isHealthy,
       lastChecked: new Date(now).toLocaleTimeString(),
+      liveSource,
     };
+
+    this.statusCache = statusResult;
+    this.lastCheckTime = now;
+    this.notifyStatusListeners(statusResult);
+
+    return statusResult;
   }
 
   static async getCurrentIndex(bookingWindow?: BookingWindow): Promise<{ data: IndexResult; status: DataProviderStatus }> {
@@ -100,7 +145,7 @@ export class DataProvider {
     return { data: DEMO_ROUTES, status: { ...status, isDemo: true, isLive: false } };
   }
 
-  static async getRouteIndices(): Promise<{ data: Record<string, RouteIndex>; status: DataProviderStatus }> {
+  static async getRouteIndices(bookingWindow?: BookingWindow): Promise<{ data: Record<string, RouteIndex>; status: DataProviderStatus }> {
     const status = await this.getStatus();
     if (status.isLive) {
       try {
@@ -108,14 +153,14 @@ export class DataProvider {
         const results: Record<string, RouteIndex> = {};
         for (const r of routes) {
           try {
-            const idx = await apiService.getRouteIndex(r.route);
+            const idx = await apiService.getRouteIndex(r.route, bookingWindow);
             results[r.route] = idx;
           } catch {
             results[r.route] = DEMO_ROUTE_INDICES[r.route] || {
               route: r.route,
               index: 100.0,
               timestamp: new Date().toISOString(),
-              booking_window: 'T+15',
+              booking_window: bookingWindow || 'T+15',
               status: 'DEMO',
             };
           }
@@ -130,8 +175,15 @@ export class DataProvider {
 
   static async getRouteContributions(): Promise<{ data: RouteContribution[]; status: DataProviderStatus }> {
     const status = await this.getStatus();
-    // Currently contributions are calculated inside engine / output in backend
-    return { data: DEMO_ROUTE_CONTRIBUTIONS, status: { ...status, isDemo: !status.isLive } };
+    if (status.isLive) {
+      try {
+        const data = await apiService.getRouteContributions();
+        if (data && data.length > 0) return { data, status };
+      } catch (err: any) {
+        console.warn('API fetch failed for getRouteContributions, falling back to Demo Data:', err.message);
+      }
+    }
+    return { data: DEMO_ROUTE_CONTRIBUTIONS, status: { ...status, isDemo: true, isLive: false } };
   }
 
   static async getBookingWindowSnapshots(): Promise<{ data: Record<BookingWindow, IndexResult>; status: DataProviderStatus }> {
@@ -154,7 +206,62 @@ export class DataProvider {
 
   static async getHeatmapData(): Promise<{ data: any[]; status: DataProviderStatus }> {
     const status = await this.getStatus();
-    return { data: DEMO_HEATMAP_DATA, status: { ...status, isDemo: !status.isLive } };
+    if (status.isLive) {
+      try {
+        const data = await apiService.getBookingWindowsMatrix();
+        if (data && data.length > 0) return { data, status };
+      } catch (err: any) {
+        console.warn('API fetch failed for getHeatmapData, falling back to Demo Data:', err.message);
+      }
+    }
+    return { data: DEMO_HEATMAP_DATA, status: { ...status, isDemo: true, isLive: false } };
+  }
+
+  static async getBookingWindowsComparisonHistory(): Promise<{ data: any[]; status: DataProviderStatus }> {
+    const status = await this.getStatus();
+    const windows: BookingWindow[] = ['T+1', 'T+7', 'T+15', 'T+30', 'T+45'];
+    if (status.isLive) {
+      try {
+        const windowHistories = await Promise.all(
+          windows.map((w) => apiService.getWindowIndex(w).catch(() => ({ items: [] })))
+        );
+
+        const dateMap = new Map<string, any>();
+        windows.forEach((w, i) => {
+          const hist = windowHistories[i];
+          if (hist && Array.isArray(hist.items)) {
+            for (const item of hist.items) {
+              if (!dateMap.has(item.observation_date)) {
+                dateMap.set(item.observation_date, { date: item.observation_date });
+              }
+              dateMap.get(item.observation_date)![w] = item.index;
+            }
+          }
+        });
+
+        const sorted = Array.from(dateMap.values()).sort((a, b) => a.date.localeCompare(b.date));
+        if (sorted.length > 0) {
+          return { data: sorted, status };
+        }
+      } catch (err: any) {
+        console.warn('Failed to fetch multi-window comparison history, falling back:', err.message);
+      }
+    }
+
+    // Mathematically aligned demo fallback
+    const baseItems = generateDemoHistory(30, 100);
+    const demoOverlay = baseItems.map((item) => {
+      const val = item.index ?? 110;
+      return {
+        date: item.observation_date,
+        'T+1': parseFloat((val * 1.108).toFixed(1)),
+        'T+7': parseFloat((val * 1.033).toFixed(1)),
+        'T+15': val,
+        'T+30': parseFloat((val * 0.951).toFixed(1)),
+        'T+45': parseFloat((val * 0.918).toFixed(1)),
+      };
+    });
+    return { data: demoOverlay, status: { ...status, isDemo: true, isLive: false } };
   }
 
   static async getIntelligenceEvents(shocksOnly = false): Promise<{ data: IntelligenceEvent[]; status: DataProviderStatus }> {
@@ -171,24 +278,50 @@ export class DataProvider {
     return { data: filtered, status: { ...status, isDemo: true, isLive: false } };
   }
 
-  static async getQualityMetrics(): Promise<{ data: QualityMetric[]; sourceHealth: SourceHealth[]; status: DataProviderStatus }> {
+  static async getQualityMetrics(): Promise<{
+    data: QualityMetric[];
+    sourceHealth: SourceHealth[];
+    summary?: QualitySummary;
+    status: DataProviderStatus;
+  }> {
     const status = await this.getStatus();
     if (status.isLive) {
       try {
-        const data = await apiService.getQualityMetrics();
-        if (data && data.length > 0) {
-          return { data, sourceHealth: DEMO_SOURCE_HEALTH, status };
-        }
+        const [metrics, summary] = await Promise.all([
+          apiService.getQualityMetrics(),
+          apiService.getQualitySummary().catch(() => null),
+        ]);
+        const sourceHealth = summary?.source_health && summary.source_health.length > 0
+          ? summary.source_health
+          : DEMO_SOURCE_HEALTH;
+        return {
+          data: metrics.length > 0 ? metrics : DEMO_QUALITY_METRICS,
+          sourceHealth,
+          summary: summary || undefined,
+          status,
+        };
       } catch (err: any) {
         console.warn('API fetch failed for getQualityMetrics, falling back to Demo Data:', err.message);
       }
     }
-    return { data: DEMO_QUALITY_METRICS, sourceHealth: DEMO_SOURCE_HEALTH, status: { ...status, isDemo: true, isLive: false } };
+    return {
+      data: DEMO_QUALITY_METRICS,
+      sourceHealth: DEMO_SOURCE_HEALTH,
+      status: { ...status, isDemo: true, isLive: false },
+    };
   }
 
   static async getValidationResult(): Promise<{ data: ValidationResult; status: DataProviderStatus }> {
     const status = await this.getStatus();
-    return { data: DEMO_VALIDATION_RESULT, status: { ...status, isDemo: !status.isLive } };
+    if (status.isLive) {
+      try {
+        const data = await apiService.getValidationResult();
+        return { data, status };
+      } catch (err: any) {
+        console.warn('API fetch failed for getValidationResult, falling back to Demo Data:', err.message);
+      }
+    }
+    return { data: DEMO_VALIDATION_RESULT, status: { ...status, isDemo: true, isLive: false } };
   }
 
   static async getConfidenceMetrics(): Promise<{ data: ConfidenceMetrics; status: DataProviderStatus }> {

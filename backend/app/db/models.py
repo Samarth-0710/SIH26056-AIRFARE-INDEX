@@ -87,6 +87,7 @@ class QualityMetric(Base):
     anomalous_valid_observations: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(30))
     generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    route: Mapped[Optional[Route]] = relationship()
 
 
 class IntelligenceEvent(Base):
@@ -117,5 +118,30 @@ class SimulationResult(Base):
     input_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
     route: Mapped[Route] = relationship()
+
+
+class MoSPIAirfareReference(Base):
+    """External macroeconomic CPI reference series for passenger transport by air (domestic).
+
+    This table stores external validation data from MoSPI e-Sankhyiki (2024 = 100).
+    It is NEVER mixed with fare_observations or used as an input to the official daily Jevons index.
+    """
+    __tablename__ = "mospi_airfare_reference"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    reference_date: Mapped[date] = mapped_column(Date, index=True)
+    index_value: Mapped[Decimal] = mapped_column(Numeric(12, 4))
+    item_code: Mapped[str] = mapped_column(String(30))
+    item: Mapped[str] = mapped_column(String(50), default="Airfare")
+    base_year: Mapped[int] = mapped_column(Integer)
+    series: Mapped[str] = mapped_column(String(50), default="Current")
+    source: Mapped[str] = mapped_column(String(80), default="MoSPI e-Sankhyiki")
+    frequency: Mapped[str] = mapped_column(String(20), default="MONTHLY")
+    state: Mapped[str] = mapped_column(String(50), default="All India")
+    sector: Mapped[str] = mapped_column(String(50), default="Combined")
+    retrieved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    __table_args__ = (
+        UniqueConstraint("reference_date", "item_code", "base_year", name="uq_mospi_reference"),
+    )
+
 
 Index("ix_route_index_unique_lookup", RouteIndex.index_result_id, RouteIndex.route_id)

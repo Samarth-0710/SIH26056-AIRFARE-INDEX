@@ -9,7 +9,7 @@ import { LoadingSkeleton } from '@/components/ui/LoadingSkeleton';
 import { ErrorState } from '@/components/ui/ErrorState';
 import { CalendarClock, Info, Layers, TrendingUp } from 'lucide-react';
 import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid, Legend } from 'recharts';
-import { formatDate } from '@/lib/utils';
+import { formatDate, formatIndex } from '@/lib/utils';
 
 const WINDOW_LABELS: Record<BookingWindow, { title: string; desc: string }> = {
   'T+1': { title: 'T+1 Window', desc: '1-day advance booking (Last-minute demand)' },
@@ -35,29 +35,15 @@ export default function BookingWindowsPage() {
       const statusRes = await DataProvider.getStatus();
       setStatus(statusRes);
 
-      const [snapRes, heatRes, histRes] = await Promise.all([
+      const [snapRes, heatRes, compHistRes] = await Promise.all([
         DataProvider.getBookingWindowSnapshots(),
         DataProvider.getHeatmapData(),
-        DataProvider.getIndexHistory(30),
+        DataProvider.getBookingWindowsComparisonHistory(),
       ]);
 
       setSnapshots(snapRes.data);
       setHeatmapData(heatRes.data);
-
-      // Build synthetic multi-window history overlay for comparison chart
-      const baseItems = histRes.data.items;
-      const overlayData = baseItems.map((item, idx) => {
-        const val = item.index ?? 110;
-        return {
-          date: item.observation_date,
-          'T+1': parseFloat((val * 1.10 + Math.sin(idx / 2) * 1.5).toFixed(1)),
-          'T+7': parseFloat((val * 1.03 + Math.sin(idx / 3) * 1.0).toFixed(1)),
-          'T+15': val,
-          'T+30': parseFloat((val * 0.95 - Math.cos(idx / 4) * 0.8).toFixed(1)),
-          'T+45': parseFloat((val * 0.92 - Math.sin(idx / 5) * 0.5).toFixed(1)),
-        };
-      });
-      setComparisonHistory(overlayData);
+      setComparisonHistory(compHistRes.data);
     } catch (err: any) {
       setError(err.message || 'Failed to load booking window analysis');
     } finally {
@@ -172,7 +158,7 @@ function ComparisonTooltip({ active, payload, label }: any) {
         {payload.map((p: any) => (
           <div key={p.dataKey} className="flex items-center justify-between gap-4">
             <span style={{ color: p.color }} className="font-bold">{p.name}:</span>
-            <span className="font-bold">{p.value?.toFixed(1) ?? 'N/A'}</span>
+            <span className="font-bold">{formatIndex(p.value)}</span>
           </div>
         ))}
       </div>

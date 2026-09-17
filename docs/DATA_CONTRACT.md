@@ -38,7 +38,7 @@ The statistical engine does **not** consume raw scraped records. Upstream normal
 
 ### 3.1 Field Definitions
 
-The table below defines every field supported and required by the statistical engine's [`FareObservation`](file:///Users/samarth07/Documents/Hackathon/sih26056-airfare-index/statistical-engine/src/statistical_engine/models/observation.py):
+The table below defines every field supported and required by the statistical engine's [`FareObservation`](../statistical-engine/src/statistical_engine/models/observation.py):
 
 | Field Name | Type | Required | Format / Valid Values | Validation Rule | Purpose in Pipeline | Fingerprint? | Contract Category |
 |---|---|:---:|---|---|---|:---:|---|
@@ -145,7 +145,7 @@ Route indices are aggregated into national composite indices using reference wei
 
 ### 6.1 WeightConfig Specification
 
-The statistical engine accepts route weights via the [`WeightConfig`](file:///Users/samarth07/Documents/Hackathon/sih26056-airfare-index/statistical-engine/src/statistical_engine/models/weights.py) container:
+The statistical engine accepts route weights via the [`WeightConfig`](../statistical-engine/src/statistical_engine/models/weights.py) container:
 
 | Field Name | Type | Required | Description |
 |---|---|:---:|---|
@@ -192,7 +192,7 @@ output: EngineCalculationOutput = engine.calculate_daily_indices(
 
 ## 8. Statistical Engine Output
 
-The engine produces structured, strongly-typed results via [`EngineCalculationOutput`](file:///Users/samarth07/Documents/Hackathon/sih26056-airfare-index/statistical-engine/src/statistical_engine/models/index_result.py):
+The engine produces structured, strongly-typed results via [`EngineCalculationOutput`](../statistical-engine/src/statistical_engine/models/index_result.py):
 
 ### 8.1 Calculation Status
 - **`SUCCESS`**: Calculation completed successfully with full basket coverage.

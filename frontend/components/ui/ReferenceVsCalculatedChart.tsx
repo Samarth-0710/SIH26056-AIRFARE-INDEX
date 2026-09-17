@@ -12,7 +12,7 @@ import {
   Legend,
 } from 'recharts';
 import { ValidationHistoryPoint } from '@/types';
-import { formatDate } from '@/lib/utils';
+import { formatDate, formatIndex, formatNumber } from '@/lib/utils';
 import { AlertCircle } from 'lucide-react';
 
 interface ReferenceVsCalculatedChartProps {
@@ -106,17 +106,17 @@ function ValidationTooltip({ active, payload, label }: any) {
   if (active && payload && payload.length) {
     const calc = payload.find((p: any) => p.dataKey === 'calculated_index')?.value;
     const ref = payload.find((p: any) => p.dataKey === 'reference_index')?.value;
-    const diff = calc && ref ? (calc - ref).toFixed(2) : 'N/A';
+    const diff = calc !== undefined && calc !== null && ref !== undefined && ref !== null ? formatNumber(calc - ref, 2) : 'N/A';
     return (
       <div className="bg-slate-900 text-white p-3 rounded-lg shadow-xl border border-slate-800 text-xs font-mono space-y-1">
         <div className="text-slate-400 text-[11px] border-b border-slate-800 pb-1">{formatDate(label)}</div>
         <div className="flex items-center justify-between gap-4 text-blue-400 font-bold">
           <span>Calculated:</span>
-          <span>{calc?.toFixed(1) ?? 'N/A'}</span>
+          <span>{formatIndex(calc)}</span>
         </div>
         <div className="flex items-center justify-between gap-4 text-emerald-400 font-bold">
           <span>Reference:</span>
-          <span>{ref?.toFixed(1) ?? 'N/A'}</span>
+          <span>{formatIndex(ref)}</span>
         </div>
         <div className="flex items-center justify-between gap-4 text-slate-300 text-[11px] pt-1">
           <span>Divergence (MAE):</span>

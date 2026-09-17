@@ -22,11 +22,20 @@ class RouteOut(APIModel):
 
 class RouteIndexOut(APIModel):
     route: str
-    index: Decimal | None
-    previous_index: Decimal | None = None
-    change_percent: Decimal | None = None
-    weight: Decimal | None = None
-    contribution: Decimal | None = None
+    index: float | None
+    previous_index: float | None = None
+    change_percent: float | None = None
+    weight: float | None = None
+    contribution: float | None = None
     timestamp: object
     booking_window: str
     status: str
+
+
+class RouteContributionOut(APIModel):
+    route: str
+    weight: float
+    route_index: float
+    level_contribution: float
+    point_contribution: float
+    percentage_share_of_change: float

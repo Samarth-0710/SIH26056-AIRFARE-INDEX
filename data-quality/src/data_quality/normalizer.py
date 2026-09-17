@@ -58,8 +58,11 @@ SOURCE_ALIASES = {
     "IXIGO": "IXIGO",
     "IXIGO.COM": "IXIGO",
 
-    # Controlled test source
+    # Controlled test and collection sources
     "TEST": "TEST",
+    "MOCK": "MOCK",
+    "DEMO": "MOCK",
+    "IGNAV": "IGNAV",
 }
 
 

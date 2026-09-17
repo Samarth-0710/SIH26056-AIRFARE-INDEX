@@ -106,13 +106,14 @@ class PipelineResult:
 # ---------------------------------------------------------------------------
 
 def process_observation(
-    observation: RawFareObservation,
+    observation: Any,
 ) -> tuple[
     Optional[NormalizedFareObservation],
     Optional[RawFareObservation],
 ]:
     """
-    Process one raw observation.
+    Process one raw observation. Accepts either Data Quality RawFareObservation
+    or Data Collection RawFareRecord seamlessly.
 
     Returns:
 
@@ -122,6 +123,9 @@ def process_observation(
         (None, raw_observation)
             when rejected
     """
+    from .bridge import raw_record_to_raw_observation
+    if not isinstance(observation, RawFareObservation):
+        observation = raw_record_to_raw_observation(observation)
 
     status, reason = classify_raw_observation(
         observation
@@ -186,7 +190,7 @@ def process_observation(
 # ---------------------------------------------------------------------------
 
 def process_observations(
-    observations: Iterable[RawFareObservation],
+    observations: Iterable[Any],
 ) -> PipelineResult:
     """
     Process multiple raw observations.
@@ -247,7 +251,7 @@ def process_observations(
 # ---------------------------------------------------------------------------
 
 def run_pipeline(
-    observations: Iterable[RawFareObservation],
+    observations: Iterable[Any],
 ) -> PipelineResult:
     """
     Run the complete data-quality pipeline.

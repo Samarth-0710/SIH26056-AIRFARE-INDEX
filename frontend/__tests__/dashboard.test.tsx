@@ -82,6 +82,11 @@ describe('Overview Dashboard Page', () => {
       },
       status: { isDemo: true, isLive: false },
     });
+
+    (DataProvider.getValidationResult as jest.Mock).mockResolvedValue({
+      data: { is_reference_connected: true },
+      status: { isDemo: true, isLive: false },
+    });
   });
 
   it('renders National Airfare Price Index value cleanly', async () => {
@@ -97,6 +102,61 @@ describe('Overview Dashboard Page', () => {
     await waitFor(() => {
       expect(screen.getByText('Measurement Reliability & Confidence')).toBeInTheDocument();
       expect(screen.getAllByText('94%').length).toBeGreaterThan(0);
+    });
+  });
+
+  it('renders Real MoSPI validation and Real live airfare data status indicators in fallback/demo mode', async () => {
+    render(<DashboardPage />);
+    await waitFor(() => {
+      expect(screen.getByText('Real MoSPI validation')).toBeInTheDocument();
+      expect(screen.getByText('🟢 Connected')).toBeInTheDocument();
+      expect(screen.getByText('Real live airfare data')).toBeInTheDocument();
+      expect(screen.getByText('🟡 Not demonstrated')).toBeInTheDocument();
+      expect(screen.getByText('Live API credentials unconfigured; fallback active')).toBeInTheDocument();
+    });
+  });
+
+  it('renders Real live airfare data as CONNECTED when live source is available', async () => {
+    (DataProvider.getStatus as jest.Mock).mockResolvedValue({
+      isDemo: false,
+      isLive: true,
+      lastChecked: '20:00:00',
+      liveSource: {
+        source: 'IGNAV',
+        is_configured: true,
+        is_connected: true,
+        status: 'CONNECTED',
+        message: 'Live Ignav airfare data is available.',
+      },
+    });
+
+    render(<DashboardPage />);
+    await waitFor(() => {
+      expect(screen.getByText('Real live airfare data')).toBeInTheDocument();
+      expect(screen.getAllByText('🟢 Connected').length).toBeGreaterThanOrEqual(1);
+      expect(screen.getByText('Live Ignav airfare data is available.')).toBeInTheDocument();
+    });
+  });
+
+  it('renders Real live airfare data as DEGRADED when live source is unreachable', async () => {
+    (DataProvider.getStatus as jest.Mock).mockResolvedValue({
+      isDemo: false,
+      isLive: true,
+      lastChecked: '20:00:00',
+      liveSource: {
+        source: 'IGNAV',
+        is_configured: true,
+        is_connected: false,
+        status: 'DEGRADED',
+        message: 'Live Ignav API unreachable; synthetic fallback active',
+      },
+    });
+
+    render(<DashboardPage />);
+    await waitFor(() => {
+      expect(screen.getByText('Real live airfare data')).toBeInTheDocument();
+      expect(screen.getByText('🔴 Degraded')).toBeInTheDocument();
+      expect(screen.getByText('Live Ignav API unreachable; synthetic fallback active')).toBeInTheDocument();
     });
   });
 });

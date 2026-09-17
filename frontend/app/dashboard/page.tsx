@@ -28,9 +28,10 @@ import {
   ArrowRight,
   TrendingUp,
   Radio,
+  CheckCircle2,
 } from 'lucide-react';
 import Link from 'next/link';
-import { formatIndex, formatPercent } from '@/lib/utils';
+import { formatIndex, formatPercent, cn } from '@/lib/utils';
 
 export default function DashboardPage() {
   const [loading, setLoading] = React.useState(true);
@@ -44,6 +45,7 @@ export default function DashboardPage() {
   const [events, setEvents] = React.useState<IntelligenceEvent[]>([]);
   const [quality, setQuality] = React.useState<QualityMetric[]>([]);
   const [confidence, setConfidence] = React.useState<ConfidenceMetrics | undefined>();
+  const [isMoSPIConnected, setIsMoSPIConnected] = React.useState<boolean>(false);
 
   const loadData = React.useCallback(async () => {
     setLoading(true);
@@ -60,6 +62,7 @@ export default function DashboardPage() {
         eventRes,
         qualRes,
         confRes,
+        valRes,
       ] = await Promise.all([
         DataProvider.getCurrentIndex(),
         DataProvider.getIndexHistory(90),
@@ -68,6 +71,9 @@ export default function DashboardPage() {
         DataProvider.getIntelligenceEvents(false),
         DataProvider.getQualityMetrics(),
         DataProvider.getConfidenceMetrics(),
+        typeof DataProvider.getValidationResult === 'function'
+          ? DataProvider.getValidationResult().catch(() => ({ data: { is_reference_connected: false } }))
+          : Promise.resolve({ data: { is_reference_connected: false } }),
       ]);
 
       setNationalIndex(indexRes.data);
@@ -77,6 +83,7 @@ export default function DashboardPage() {
       setEvents(eventRes.data);
       setQuality(qualRes.data);
       setConfidence(confRes.data);
+      setIsMoSPIConnected(Boolean((valRes as any)?.data?.is_reference_connected));
     } catch (err: any) {
       setError(err.message || 'Failed to load dashboard data');
     } finally {
@@ -94,6 +101,11 @@ export default function DashboardPage() {
   const isDemo = status?.isDemo ?? true;
   const activeShock = events.find((e) => e.event_type === 'AIRFARE_SHOCK');
 
+  const isLiveConnected = Boolean(!isDemo && status?.liveSource?.is_connected);
+  const liveSourceStatus = status?.liveSource?.status || 'NOT_CONFIGURED';
+  const liveSourceMessage = status?.liveSource?.message || 'Live API credentials unconfigured; fallback active';
+  const isLiveDegraded = Boolean(!isDemo && (liveSourceStatus === 'DEGRADED' || liveSourceStatus === 'ERROR'));
+
   return (
     <div className="space-y-6">
       {/* Top Banner / Disclaimer */}
@@ -110,6 +122,77 @@ export default function DashboardPage() {
           </span>
         </div>
       )}
+
+      {/* System Integrity & Reference Connection Status Strip */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+        <div className="p-3 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl flex items-center justify-between shadow-sm">
+          <div className="flex items-center space-x-2.5">
+            {isMoSPIConnected ? (
+              <CheckCircle2 className="w-4 h-4 text-emerald-500 shrink-0" />
+            ) : (
+              <AlertTriangle className="w-4 h-4 text-amber-500 shrink-0" />
+            )}
+            <div>
+              <div className="font-bold text-slate-900 dark:text-slate-100 flex items-center gap-1.5">
+                <span>Real MoSPI validation</span>
+                <Link href="/validation" className="text-[11px] text-blue-600 hover:underline">
+                  (Details &rarr;)
+                </Link>
+              </div>
+              <div className="text-[11px] text-slate-500">
+                {isMoSPIConnected
+                  ? 'Official CPI Airfare Series (07.3.3.1.2.01, Base 2024 = 100)'
+                  : 'External MoSPI benchmark dataset not loaded'}
+              </div>
+            </div>
+          </div>
+          <span
+            className={`font-mono text-[11px] font-bold px-2 py-0.5 rounded uppercase ${
+              isMoSPIConnected
+                ? 'bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 border border-emerald-500/40'
+                : 'bg-amber-500/20 text-amber-700 dark:text-amber-300 border border-amber-500/40'
+            }`}
+          >
+            {isMoSPIConnected ? '🟢 Connected' : '🟡 Not connected'}
+          </span>
+        </div>
+
+        <div className="p-3 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl flex items-center justify-between shadow-sm">
+          <div className="flex items-center space-x-2.5">
+            {isLiveConnected ? (
+              <CheckCircle2 className="w-4 h-4 text-emerald-500 shrink-0" />
+            ) : isLiveDegraded ? (
+              <AlertTriangle className="w-4 h-4 text-rose-500 shrink-0" />
+            ) : (
+              <AlertTriangle className="w-4 h-4 text-amber-500 shrink-0" />
+            )}
+            <div>
+              <div className="font-bold text-slate-900 dark:text-slate-100">Real live airfare data</div>
+              <div className="text-[11px] text-slate-500">
+                {isLiveConnected
+                  ? (status?.liveSource?.message || 'Live Ignav airfare data is available.')
+                  : liveSourceMessage}
+              </div>
+            </div>
+          </div>
+          <span
+            className={cn(
+              'font-mono text-[11px] font-bold px-2 py-0.5 rounded uppercase border',
+              isLiveConnected
+                ? 'bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 border-emerald-500/40'
+                : isLiveDegraded
+                ? 'bg-rose-500/20 text-rose-700 dark:text-rose-300 border-rose-500/40'
+                : 'bg-amber-500/20 text-amber-700 dark:text-amber-300 border-amber-500/40'
+            )}
+          >
+            {isLiveConnected
+              ? '🟢 Connected'
+              : isLiveDegraded
+              ? '🔴 Degraded'
+              : '🟡 Not demonstrated'}
+          </span>
+        </div>
+      </div>
 
       {/* Main KPI Grid */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -140,12 +223,12 @@ export default function DashboardPage() {
         <KpiCard
           title="Top Inflating Corridor"
           value={contributions[0]?.route_index}
-          changePercent={4.23}
+          changePercent={contributions[0]?.point_contribution ?? 0}
           isDemo={isDemo}
-          statusText={contributions[0]?.route || 'DEL-BOM'}
+          statusText={contributions[0]?.route || 'N/A'}
           badge="CORRIDOR"
           icon={TrendingUp}
-          subtitle={`Weight: ${(contributions[0]?.weight ? contributions[0].weight * 100 : 28).toFixed(1)}%`}
+          subtitle={contributions[0]?.weight != null ? `Weight: ${(contributions[0].weight * 100).toFixed(1)}%` : 'Corridor weight pending'}
         />
 
         <KpiCard
