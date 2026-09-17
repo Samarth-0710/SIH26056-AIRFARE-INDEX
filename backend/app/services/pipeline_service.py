@@ -17,7 +17,7 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import desc, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.db.models import (
     FareObservation as DBFareObservation,
@@ -38,7 +38,7 @@ from data_quality.bridge import (
     raw_record_to_raw_observation,
 )
 from data_quality.models import QualityStatus as DQQualityStatus
-from data_quality.pipeline import run_pipeline
+from data_quality.pipeline import run_pipeline as run_dq_pipeline
 from intelligence.integration.statistical_engine_adapter import (
     StatisticalEngineIntelligenceAdapter,
 )
@@ -46,8 +46,95 @@ from statistical_engine.engine import AirfareStatisticalEngine
 from statistical_engine.models.observation import (
     BookingWindow as SEBookingWindow,
     FareObservation as EngineFareObservation,
+    QualityStatus as SEQualityStatus,
 )
 from statistical_engine.models.weights import get_demo_reference_weights
+
+
+def db_obs_to_engine_obs(db_obs: DBFareObservation) -> Optional[EngineFareObservation]:
+    """Convert a persisted DBFareObservation into a statistical EngineFareObservation."""
+    try:
+        origin = db_obs.route.origin if db_obs.route else (db_obs.metadata_json or {}).get("origin")
+        destination = db_obs.route.destination if db_obs.route else (db_obs.metadata_json or {}).get("destination")
+        if not origin or not destination:
+            if db_obs.route and "-" in db_obs.route.code:
+                origin, destination = db_obs.route.code.split("-", 1)
+        if not origin or not destination:
+            return None
+
+        bw = SEBookingWindow.from_string(db_obs.booking_window)
+        qs = SEQualityStatus(db_obs.quality_status.upper()) if db_obs.quality_status else SEQualityStatus.VALID
+
+        return EngineFareObservation(
+            origin=origin,
+            destination=destination,
+            travel_date=db_obs.travel_date,
+            observation_date=db_obs.observation_date,
+            booking_window=bw,
+            airline=db_obs.airline,
+            flight_number=db_obs.flight_number,
+            departure_time=str(db_obs.departure_time),
+            cabin_class=db_obs.cabin_class,
+            fare_type=db_obs.fare_type,
+            baggage_characteristics=db_obs.baggage_characteristics,
+            comparable_fare=float(db_obs.comparable_fare),
+            source=db_obs.source,
+            observation_timestamp=db_obs.observation_timestamp,
+            quality_status=qs,
+            metadata=db_obs.metadata_json or {},
+        )
+    except Exception:
+        return None
+
+
+def _persist_normalized_observations(
+    db: Session,
+    normalized_observations: List[Any],
+    route_map: Dict[str, DBRoute],
+) -> int:
+    """Persist non-EXCLUDED normalized observations into fare_observations table."""
+    persisted_count = 0
+    for norm in normalized_observations:
+        if norm.quality_status == DQQualityStatus.EXCLUDED or getattr(norm.quality_status, "value", norm.quality_status) == "EXCLUDED":
+            continue
+
+        existing = db.scalar(
+            select(DBFareObservation.id).where(
+                DBFareObservation.fingerprint == norm.fingerprint,
+                DBFareObservation.observation_timestamp == norm.observation_timestamp,
+                DBFareObservation.source == norm.source,
+            )
+        )
+        if existing:
+            continue
+
+        r_code = f"{norm.origin}-{norm.destination}"
+        route = route_map.get(r_code) or get_or_create_route(db, r_code)
+        db_obs = DBFareObservation(
+            route_id=route.id,
+            observation_timestamp=norm.observation_timestamp,
+            observation_date=norm.observation_date,
+            travel_date=norm.travel_date,
+            booking_window=norm.booking_window.value,
+            airline=norm.airline,
+            flight_number=norm.flight_number,
+            departure_time=norm.departure_time,
+            cabin_class=norm.cabin_class,
+            fare_type=norm.fare_type,
+            baggage_characteristics=norm.baggage_characteristics,
+            base_fare=Decimal(str(norm.base_fare)) if norm.base_fare is not None else None,
+            taxes=Decimal(str(norm.taxes)) if norm.taxes is not None else None,
+            mandatory_charges=Decimal(str(norm.mandatory_charges)) if norm.mandatory_charges is not None else None,
+            comparable_fare=Decimal(str(norm.comparable_fare or 0.0)),
+            source=norm.source,
+            fingerprint=norm.fingerprint,
+            quality_status=norm.quality_status.value,
+            metadata_json=norm.metadata,
+        )
+        db.add(db_obs)
+        persisted_count += 1
+
+    return persisted_count
 
 
 DEFAULT_SAMPLE_ROUTES = [
@@ -180,19 +267,19 @@ def run_pipeline(
     price_movement_pct: float = 2.5,
     days: int = 30,
     clean: bool = True,
+    live_adapter: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Execute the full SIH26056 pipeline over a historical window and store outputs into the database."""
     end_date = target_date or date.today()
     run_timestamp = datetime.now(timezone.utc)
 
-    # 1. Optionally clean previous demo/test records for idempotency
-    if clean:
+    # 1. Optionally clean previous demo/test records for idempotency (only in synthetic mode)
+    if clean and not use_live_source:
         db.query(DBIntelligenceEvent).delete()
         db.query(DBQualityMetric).delete()
         db.query(DBRouteIndex).delete()
         db.query(DBIndexResult).delete()
         db.query(DBFareObservation).delete()
-        db.query(DBMoSPIAirfareReference).delete()
         db.commit()
 
     # Load official MoSPI CPI reference series (separate validation layer)
@@ -204,14 +291,308 @@ def run_pipeline(
         code = f"{orig}-{dest}"
         route_map[code] = get_or_create_route(db, code)
 
-    # 3. Setup adapters and engine
-    from data_collection.mock_adapter import SyntheticFareAdapter
-    from data_quality.pipeline import run_pipeline as run_dq_pipeline
-
-    synth_adapter = SyntheticFareAdapter()
+    # 3. Setup common components
     engine = AirfareStatisticalEngine(allow_partial_coverage=True)
     weights = get_demo_reference_weights()
     intel_adapter = StatisticalEngineIntelligenceAdapter()
+
+    # =========================================================================
+    # LIVE SOURCE BRANCH
+    # =========================================================================
+    if use_live_source:
+        active_live_adapter = live_adapter
+        if active_live_adapter is None:
+            try:
+                from data_collection.ignav_adapter import IgnavFareAdapter
+                from data_collection.adapters import SourceStatus
+                candidate = IgnavFareAdapter()
+                if candidate.get_status() == SourceStatus.AVAILABLE:
+                    active_live_adapter = candidate
+            except Exception:
+                active_live_adapter = None
+
+        if active_live_adapter is None:
+            raise RuntimeError(
+                "Live data collection requested (use_live_source=True), but live source adapter is unavailable or unconfigured."
+            )
+
+        curr_date = end_date
+        prev_date = curr_date - timedelta(days=1)
+        sample_pairs = [(r[0], r[1]) for r in DEFAULT_SAMPLE_ROUTES]
+        target_windows = [1, 7, 15, 30, 45]
+
+        total_observations_stored = 0
+        total_valid_observations = 0
+        total_rejected_observations = 0
+
+        # Step 2: Look in fare_observations for REAL IGNAV observations on prev_date
+        existing_prev_db = (
+            db.query(DBFareObservation)
+            .options(joinedload(DBFareObservation.route))
+            .filter(
+                DBFareObservation.source == "IGNAV",
+                DBFareObservation.observation_date == prev_date,
+                DBFareObservation.quality_status != DQQualityStatus.EXCLUDED.value,
+            )
+            .all()
+        )
+
+        eng_prev: List[EngineFareObservation] = []
+        is_cold_start = False
+
+        if existing_prev_db:
+            for r in existing_prev_db:
+                converted = db_obs_to_engine_obs(r)
+                if converted is not None and converted.quality_status == SEQualityStatus.VALID:
+                    eng_prev.append(converted)
+
+        # Step 3 & 4: If insufficient previous live obs exist in DB, cold-start
+        if not eng_prev:
+            is_cold_start = True
+            raw_prev = active_live_adapter.collect_all(
+                observation_date=prev_date,
+                routes=sample_pairs,
+                booking_windows=target_windows,
+            )
+            dq_prev = run_dq_pipeline(raw_prev)
+            stored_prev = _persist_normalized_observations(db, dq_prev.normalized_observations, route_map)
+            total_observations_stored += stored_prev
+            total_valid_observations += dq_prev.valid_count
+            total_rejected_observations += len(dq_prev.rejected_observations)
+
+            eng_prev = [
+                normalized_to_engine_observation(n)
+                for n in dq_prev.normalized_observations
+                if n.quality_status == DQQualityStatus.VALID and normalized_to_engine_observation(n)
+            ]
+
+            qm_prev = DBQualityMetric(
+                metric_date=prev_date,
+                source="IGNAV",
+                observation_count=dq_prev.total_processed,
+                route_coverage=Decimal("1.0000"),
+                source_coverage=Decimal("1.0000"),
+                freshness_minutes=1,
+                missing_observations=len(dq_prev.rejected_observations),
+                invalid_observations=0,
+                anomalous_valid_observations=dq_prev.outlier_count,
+                status="COMPLETE",
+                generated_at=run_timestamp - timedelta(days=1),
+            )
+            db.add(qm_prev)
+
+            # Record baseline index results (100.0) for prev_date on cold start
+            prev_base_calc_version = f"CALC_{prev_date.isoformat()}_BASE"
+            for bw_enum in SEBookingWindow:
+                db_idx_prev = DBIndexResult(
+                    observation_date=prev_date,
+                    booking_window=bw_enum.value,
+                    index_value=Decimal("100.0000"),
+                    status="SUCCESS",
+                    observation_set_version=f"OBS_{prev_date.isoformat()}",
+                    basket_version="BASKET_v1.0",
+                    weight_version=weights.version,
+                    methodology_version=engine.methodology_version,
+                    calculation_version=prev_base_calc_version,
+                    execution_checksum="0" * 64,
+                    calculation_timestamp=run_timestamp - timedelta(days=1),
+                )
+                db.add(db_idx_prev)
+                db.flush()
+
+                for r_code in sorted(weights.weights.keys()):
+                    route = route_map.get(r_code) or get_or_create_route(db, r_code)
+                    w = weights.weights.get(r_code, 0.0)
+                    db_r_idx_prev = DBRouteIndex(
+                        index_result_id=db_idx_prev.id,
+                        route_id=route.id,
+                        index_value=Decimal("100.0000"),
+                        status="SUCCESS",
+                        weight=Decimal(str(round(w, 8))),
+                        contribution=Decimal("0.0000"),
+                    )
+                    db.add(db_r_idx_prev)
+
+            db.flush()
+
+        # Step 5: Collect current REAL live observations for curr_date
+        raw_curr = active_live_adapter.collect_all(
+            observation_date=curr_date,
+            routes=sample_pairs,
+            booking_windows=target_windows,
+        )
+        dq_curr = run_dq_pipeline(raw_curr)
+        stored_curr = _persist_normalized_observations(db, dq_curr.normalized_observations, route_map)
+        total_observations_stored += stored_curr
+        total_valid_observations += dq_curr.valid_count
+        total_rejected_observations += len(dq_curr.rejected_observations)
+
+        eng_curr = [
+            normalized_to_engine_observation(n)
+            for n in dq_curr.normalized_observations
+            if n.quality_status == DQQualityStatus.VALID and normalized_to_engine_observation(n)
+        ]
+
+        # Step 6: Previous route indices for chaining / contributions
+        prev_route_indices: Dict[SEBookingWindow, Dict[str, float]] = {
+            bw: {r: 100.0 for r in weights.weights} for bw in SEBookingWindow
+        }
+        prev_indices_db = (
+            db.query(DBRouteIndex)
+            .join(DBIndexResult, DBRouteIndex.index_result_id == DBIndexResult.id)
+            .join(DBRoute, DBRouteIndex.route_id == DBRoute.id)
+            .filter(DBIndexResult.observation_date == prev_date)
+            .all()
+        )
+        for pri in prev_indices_db:
+            try:
+                bw = SEBookingWindow.from_string(pri.index_result.booking_window)
+                if pri.route and pri.index_value is not None:
+                    prev_route_indices[bw][pri.route.code] = float(pri.index_value)
+            except Exception:
+                pass
+
+        # Step 7: Pass directly to the EXISTING frozen Statistical Engine
+        calc_version = f"CALC_{curr_date.isoformat()}_{int(time.time())}_LIVE"
+        calc_output = engine.calculate_daily_indices(
+            current_observations=eng_curr,
+            previous_observations=eng_prev,
+            observation_date=curr_date,
+            previous_observation_date=prev_date,
+            weight_config=weights,
+            observation_set_version=f"OBS_{curr_date.isoformat()}",
+            basket_version="BASKET_v1.0",
+            previous_route_indices=prev_route_indices,
+        )
+
+        # Step 8: Intelligence analysis
+        intel_results = intel_adapter.analyze_windows(
+            calc_output,
+            previous_route_indices_by_window=prev_route_indices,
+        )
+
+        # Step 9: Persist index results and route indices
+        national_indices_summary: Dict[str, float] = {}
+        total_index_results_stored = 0
+        total_route_indices_stored = 0
+
+        for bw_enum, nat_res in calc_output.national_results.items():
+            val = Decimal(str(round(nat_res.national_index, 4))) if nat_res.national_index is not None else None
+            if val is not None:
+                national_indices_summary[bw_enum.value] = float(val)
+
+            db_idx = DBIndexResult(
+                observation_date=curr_date,
+                booking_window=bw_enum.value,
+                index_value=val,
+                status=nat_res.status.value,
+                observation_set_version=calc_output.reproducibility.observation_set_version,
+                basket_version=calc_output.reproducibility.basket_version,
+                weight_version=calc_output.reproducibility.weight_version,
+                methodology_version=calc_output.reproducibility.methodology_version,
+                calculation_version=calc_version,
+                execution_checksum=calc_output.reproducibility.execution_checksum,
+                calculation_timestamp=run_timestamp,
+            )
+            db.add(db_idx)
+            db.flush()
+            total_index_results_stored += 1
+
+            for r_code, r_res in calc_output.route_results.items():
+                win_idx = r_res.window_indices.get(bw_enum)
+                route = route_map.get(r_code) or get_or_create_route(db, r_code)
+                r_val = Decimal(str(round(win_idx.index_value, 4))) if win_idx and win_idx.index_value is not None else None
+                r_status = win_idx.status.value if win_idx else "INSUFFICIENT_DATA"
+                w = weights.weights.get(r_code, 0.0)
+                weight_dec = Decimal(str(round(w, 8))) if w else None
+
+                contrib_obj = nat_res.route_contributions.get(r_code)
+                contrib_val = None
+                if contrib_obj:
+                    if contrib_obj.point_contribution is not None:
+                        contrib_val = contrib_obj.point_contribution
+                    elif contrib_obj.level_contribution is not None:
+                        contrib_val = contrib_obj.level_contribution
+                contrib_dec = Decimal(str(round(contrib_val, 4))) if contrib_val is not None else None
+
+                db_r_idx = DBRouteIndex(
+                    index_result_id=db_idx.id,
+                    route_id=route.id,
+                    index_value=r_val,
+                    status=r_status,
+                    weight=weight_dec,
+                    contribution=contrib_dec,
+                )
+                db.add(db_r_idx)
+                total_route_indices_stored += 1
+
+        # Store quality metric for curr_date
+        qm_curr = DBQualityMetric(
+            metric_date=curr_date,
+            source="IGNAV",
+            observation_count=dq_curr.total_processed,
+            route_coverage=Decimal("1.0000"),
+            source_coverage=Decimal("1.0000"),
+            freshness_minutes=1,
+            missing_observations=len(dq_curr.rejected_observations),
+            invalid_observations=0,
+            anomalous_valid_observations=dq_curr.outlier_count,
+            status="COMPLETE",
+            generated_at=run_timestamp,
+        )
+        db.add(qm_curr)
+
+        # Store intelligence events
+        total_intel_events_stored = 0
+        for bw_enum, intel_out in intel_results.items():
+            for anomaly in intel_out.anomalies:
+                if anomaly.detected or (anomaly.anomaly_score is not None and abs(anomaly.anomaly_score) >= 3.0):
+                    route = route_map.get(anomaly.route) if anomaly.route else None
+                    is_shock = anomaly.detected and (anomaly.anomaly_score is not None and abs(anomaly.anomaly_score) >= 4.0)
+                    evt = DBIntelligenceEvent(
+                        route_id=route.id if route else None,
+                        event_type="AIRFARE_SHOCK" if is_shock else "ANOMALY",
+                        anomaly_score=Decimal(str(round(anomaly.anomaly_score, 4))) if anomaly.anomaly_score is not None else None,
+                        pressure_score=Decimal(str(round(min(100.0, max(0.0, abs(anomaly.anomaly_score or 0.0) * 10.0 + 35.0)), 4))),
+                        shock_status="ALERT" if is_shock else "NORMAL",
+                        explanation=anomaly.reason or f"Price movement on {anomaly.route} for {bw_enum.value}",
+                        affected_sources=["IGNAV"],
+                        affected_routes=[anomaly.route] if anomaly.route else [],
+                        model_version=intel_out.provenance.model_version,
+                        event_timestamp=run_timestamp,
+                    )
+                    db.add(evt)
+                    total_intel_events_stored += 1
+
+        db.commit()
+
+        checksum = calc_output.reproducibility.execution_checksum if calc_output else ("0" * 64)
+        return {
+            "status": "SUCCESS",
+            "mode": "LIVE",
+            "historical_days": 1 if not is_cold_start else 2,
+            "cold_start": is_cold_start,
+            "observation_date": curr_date.isoformat(),
+            "previous_observation_date": prev_date.isoformat(),
+            "calculation_version": calc_version,
+            "national_indices": national_indices_summary,
+            "observations_stored": total_observations_stored,
+            "valid_observations": total_valid_observations,
+            "rejected_observations": total_rejected_observations,
+            "routes_processed": len(route_map),
+            "index_results_stored": total_index_results_stored,
+            "route_indices_stored": total_route_indices_stored,
+            "intelligence_events_stored": total_intel_events_stored,
+            "quality_metrics_stored": 2 if is_cold_start else 1,
+            "mospi_reference_records": mospi_count,
+            "execution_checksum": checksum,
+        }
+
+    # =========================================================================
+    # SYNTHETIC / DEMO SIMULATION BRANCH (use_live_source=False)
+    # =========================================================================
+    from data_collection.mock_adapter import SyntheticFareAdapter
+    synth_adapter = SyntheticFareAdapter()
 
     # Determine historical date range
     # Day 0 = base_date (base index 100.0)
@@ -219,56 +600,15 @@ def run_pipeline(
     num_days = max(1, days)
     base_date = end_date - timedelta(days=num_days)
 
-    # Check if live Ignav adapter is requested and available
-    live_adapter = None
-    if use_live_source:
-        try:
-            from data_collection.ignav_adapter import IgnavFareAdapter
-            from data_collection.adapters import SourceStatus
-            candidate = IgnavFareAdapter()
-            if candidate.get_status() == SourceStatus.AVAILABLE:
-                live_adapter = candidate
-        except Exception:
-            live_adapter = None
-
-    source_name = "IGNAV" if live_adapter else "mock"
-
-    # Collect base basket (Day 0)
-    raw_base = synth_adapter.collect_basket(base_date, source=source_name, day_offset=0)
-    dq_base = run_dq_pipeline(raw_base)
-
     total_observations_stored = 0
     total_valid_observations = 0
     total_rejected_observations = 0
 
-    # Store base observations (Day 0)
-    for norm in dq_base.normalized_observations:
-        r_code = f"{norm.origin}-{norm.destination}"
-        route = route_map.get(r_code) or get_or_create_route(db, r_code)
-        db_obs = DBFareObservation(
-            route_id=route.id,
-            observation_timestamp=norm.observation_timestamp,
-            observation_date=norm.observation_date,
-            travel_date=norm.travel_date,
-            booking_window=norm.booking_window.value,
-            airline=norm.airline,
-            flight_number=norm.flight_number,
-            departure_time=norm.departure_time,
-            cabin_class=norm.cabin_class,
-            fare_type=norm.fare_type,
-            baggage_characteristics=norm.baggage_characteristics,
-            base_fare=Decimal(str(norm.base_fare)) if norm.base_fare is not None else None,
-            taxes=Decimal(str(norm.taxes)) if norm.taxes is not None else None,
-            mandatory_charges=Decimal(str(norm.mandatory_charges)) if norm.mandatory_charges is not None else None,
-            comparable_fare=Decimal(str(norm.comparable_fare or 0.0)),
-            source=norm.source,
-            fingerprint=norm.fingerprint,
-            quality_status=norm.quality_status.value,
-            metadata_json=norm.metadata,
-        )
-        db.add(db_obs)
-        total_observations_stored += 1
-
+    # Collect base basket (Day 0)
+    raw_base = synth_adapter.collect_basket(base_date, source="mock", day_offset=0)
+    dq_base = run_dq_pipeline(raw_base)
+    stored_base = _persist_normalized_observations(db, dq_base.normalized_observations, route_map)
+    total_observations_stored += stored_base
     total_valid_observations += dq_base.valid_count
     total_rejected_observations += len(dq_base.rejected_observations)
 
@@ -312,7 +652,7 @@ def run_pipeline(
     # Store base quality metric
     qm_base = DBQualityMetric(
         metric_date=base_date,
-        source="MOCK" if not live_adapter else "IGNAV",
+        source="MOCK",
         observation_count=dq_base.total_processed,
         route_coverage=Decimal("1.0000"),
         source_coverage=Decimal("1.0000"),
@@ -333,14 +673,14 @@ def run_pipeline(
     ]
 
     # Initialize tracking of previous route indices for day-over-day changes
-    prev_route_indices: Dict[SEBookingWindow, Dict[str, float]] = {
+    prev_route_indices = {
         bw: {r: 100.0 for r in weights.weights} for bw in SEBookingWindow
     }
 
     total_intel_events_stored = 0
     last_calc_output = None
     last_calc_version = base_calc_version
-    national_indices_summary: Dict[str, float] = {}
+    national_indices_summary = {}
 
     # Multi-day loop: Days 1 to num_days
     for day_offset in range(1, num_days + 1):
@@ -348,25 +688,11 @@ def run_pipeline(
         calc_version = f"CALC_{curr_date.isoformat()}_{int(time.time())}_{day_offset}"
         day_timestamp = run_timestamp - timedelta(days=num_days - day_offset)
 
-        # Collect raw records for current day
-        if live_adapter and day_offset == num_days:
-            try:
-                sample_pairs = [(r[0], r[1]) for r in DEFAULT_SAMPLE_ROUTES]
-                raw_curr = live_adapter.collect_all(
-                    observation_date=curr_date,
-                    routes=sample_pairs,
-                    booking_windows=[1, 7, 15, 30, 45],
-                )
-                if not raw_curr:
-                    raw_curr = synth_adapter.collect_basket(curr_date, day_offset=day_offset, source="mock")
-            except Exception:
-                raw_curr = synth_adapter.collect_basket(curr_date, day_offset=day_offset, source="mock")
-        else:
-            raw_curr = synth_adapter.collect_basket(curr_date, day_offset=day_offset, source="mock")
+        raw_curr = synth_adapter.collect_basket(curr_date, day_offset=day_offset, source="mock")
 
         # Data Quality
         dq_curr = run_dq_pipeline(raw_curr)
-        eng_curr: List[EngineFareObservation] = [
+        eng_curr = [
             normalized_to_engine_observation(n)
             for n in dq_curr.normalized_observations
             if n.quality_status == DQQualityStatus.VALID and normalized_to_engine_observation(n)
@@ -393,33 +719,8 @@ def run_pipeline(
         )
 
         # Store current observations
-        for norm in dq_curr.normalized_observations:
-            r_code = f"{norm.origin}-{norm.destination}"
-            route = route_map.get(r_code) or get_or_create_route(db, r_code)
-            db_obs = DBFareObservation(
-                route_id=route.id,
-                observation_timestamp=norm.observation_timestamp,
-                observation_date=norm.observation_date,
-                travel_date=norm.travel_date,
-                booking_window=norm.booking_window.value,
-                airline=norm.airline,
-                flight_number=norm.flight_number,
-                departure_time=norm.departure_time,
-                cabin_class=norm.cabin_class,
-                fare_type=norm.fare_type,
-                baggage_characteristics=norm.baggage_characteristics,
-                base_fare=Decimal(str(norm.base_fare)) if norm.base_fare is not None else None,
-                taxes=Decimal(str(norm.taxes)) if norm.taxes is not None else None,
-                mandatory_charges=Decimal(str(norm.mandatory_charges)) if norm.mandatory_charges is not None else None,
-                comparable_fare=Decimal(str(norm.comparable_fare or 0.0)),
-                source=norm.source,
-                fingerprint=norm.fingerprint,
-                quality_status=norm.quality_status.value,
-                metadata_json=norm.metadata,
-            )
-            db.add(db_obs)
-            total_observations_stored += 1
-
+        stored_curr = _persist_normalized_observations(db, dq_curr.normalized_observations, route_map)
+        total_observations_stored += stored_curr
         total_valid_observations += dq_curr.valid_count
         total_rejected_observations += len(dq_curr.rejected_observations)
 
@@ -477,7 +778,7 @@ def run_pipeline(
         # Store quality metric
         qm = DBQualityMetric(
             metric_date=curr_date,
-            source="MOCK" if not live_adapter else "IGNAV",
+            source="MOCK",
             observation_count=dq_curr.total_processed,
             route_coverage=Decimal("1.0000"),
             source_coverage=Decimal("1.0000"),
@@ -503,7 +804,7 @@ def run_pipeline(
                         pressure_score=Decimal(str(round(min(100.0, max(0.0, abs(anomaly.anomaly_score or 0.0) * 10.0 + 35.0)), 4))),
                         shock_status="ALERT" if is_shock else "NORMAL",
                         explanation=anomaly.reason or f"Price movement on {anomaly.route} for {bw_enum.value}",
-                        affected_sources=["MOCK" if not live_adapter else "IGNAV"],
+                        affected_sources=["MOCK"],
                         affected_routes=[anomaly.route] if anomaly.route else [],
                         model_version=intel_out.provenance.model_version,
                         event_timestamp=day_timestamp,
@@ -524,7 +825,7 @@ def run_pipeline(
 
     return {
         "status": "SUCCESS",
-        "mode": "LIVE" if live_adapter else "SYNTHETIC",
+        "mode": "SYNTHETIC",
         "historical_days": num_days,
         "observation_date": end_date.isoformat(),
         "previous_observation_date": base_date.isoformat(),

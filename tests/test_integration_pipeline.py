@@ -369,3 +369,118 @@ def test_boundary_7_complete_end_to_end_flow(test_client):
     sim_res = test_client.post("/api/v1/simulation", json={"route": "DEL-BLR", "shock_percent": 20})
     assert sim_res.status_code == 201
     assert sim_res.json()["projected_index"] is not None
+
+
+# ==============================================================================
+# TEST 8: Regression Test — EXCLUDED / Duplicate Observations Skipped from DB
+# ==============================================================================
+def test_regression_excluded_duplicate_observations_skipped(db_session):
+    """Verify that observations marked EXCLUDED (such as duplicates) by Data Quality
+    are NOT inserted into the official fare_observations table, while VALID observations
+    are persisted normally without violating the unique constraint.
+    """
+    from datetime import time as dtime
+    from app.services.helpers import get_or_create_route
+
+    now = datetime.now(timezone.utc)
+    obs_date = date(2026, 9, 14)
+    travel_d = obs_date + timedelta(days=15)
+
+    # 1 original, 1 exact duplicate, 1 distinct record
+    rec_original = RawFareRecord(
+        origin="BLR",
+        destination="DEL",
+        travel_date=travel_d,
+        observation_date=obs_date,
+        booking_window=15,
+        airline="IndiGo",
+        flight_number="6E-201",
+        departure_time=dtime(6, 30),
+        cabin_class="ECONOMY",
+        fare_type="SAVER",
+        baggage_characteristics="15KG",
+        fare_amount=5000.0,
+        currency="INR",
+        source="IGNAV",
+        observation_timestamp=now,
+    )
+    rec_duplicate = RawFareRecord(
+        origin="BLR",
+        destination="DEL",
+        travel_date=travel_d,
+        observation_date=obs_date,
+        booking_window=15,
+        airline="IndiGo",
+        flight_number="6E-201",
+        departure_time=dtime(6, 30),
+        cabin_class="ECONOMY",
+        fare_type="SAVER",
+        baggage_characteristics="15KG",
+        fare_amount=5000.0,
+        currency="INR",
+        source="IGNAV",
+        observation_timestamp=now,
+    )
+    rec_distinct = RawFareRecord(
+        origin="BLR",
+        destination="DEL",
+        travel_date=travel_d,
+        observation_date=obs_date,
+        booking_window=15,
+        airline="Air India",
+        flight_number="AI-102",
+        departure_time=dtime(11, 45),
+        cabin_class="ECONOMY",
+        fare_type="REGULAR",
+        baggage_characteristics="15KG",
+        fare_amount=6000.0,
+        currency="INR",
+        source="IGNAV",
+        observation_timestamp=now,
+    )
+
+    dq_result = run_dq_pipeline([rec_original, rec_duplicate, rec_distinct])
+    assert len(dq_result.normalized_observations) == 3
+
+    statuses = [n.quality_status for n in dq_result.normalized_observations]
+    assert DQQualityStatus.EXCLUDED in statuses
+    assert DQQualityStatus.VALID in statuses
+
+    route = get_or_create_route(db_session, "BLR-DEL")
+
+    stored_count = 0
+    for norm in dq_result.normalized_observations:
+        if norm.quality_status == DQQualityStatus.EXCLUDED or getattr(norm.quality_status, "value", norm.quality_status) == "EXCLUDED":
+            continue
+        db_obs = DBFareObservation(
+            route_id=route.id,
+            observation_timestamp=norm.observation_timestamp,
+            observation_date=norm.observation_date,
+            travel_date=norm.travel_date,
+            booking_window=norm.booking_window.value,
+            airline=norm.airline,
+            flight_number=norm.flight_number,
+            departure_time=norm.departure_time,
+            cabin_class=norm.cabin_class,
+            fare_type=norm.fare_type,
+            baggage_characteristics=norm.baggage_characteristics,
+            base_fare=Decimal(str(norm.base_fare)) if norm.base_fare is not None else None,
+            taxes=Decimal(str(norm.taxes)) if norm.taxes is not None else None,
+            mandatory_charges=Decimal(str(norm.mandatory_charges)) if norm.mandatory_charges is not None else None,
+            comparable_fare=Decimal(str(norm.comparable_fare or 0.0)),
+            source=norm.source,
+            fingerprint=norm.fingerprint,
+            quality_status=norm.quality_status.value,
+            metadata_json=norm.metadata,
+        )
+        db_session.add(db_obs)
+        stored_count += 1
+
+    # Commit must succeed without UNIQUE constraint IntegrityError
+    db_session.commit()
+
+    all_stored = db_session.query(DBFareObservation).all()
+    assert len(all_stored) == 2
+    assert stored_count == 2
+    for stored in all_stored:
+        assert stored.quality_status != "EXCLUDED"
