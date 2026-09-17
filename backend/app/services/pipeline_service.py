@@ -16,7 +16,7 @@ from datetime import date, datetime, time as dtime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.db.models import (
@@ -283,7 +283,11 @@ def run_pipeline(
         db.commit()
 
     # Load official MoSPI CPI reference series (separate validation layer)
-    mospi_count = load_mospi_reference_dataset(db)
+    load_mospi_reference_dataset(db)
+
+    mospi_count = db.scalar(
+        select(func.count()).select_from(DBMoSPIAirfareReference)
+    ) or 0
 
     # 2. Ensure routes exist in DB
     route_map: Dict[str, DBRoute] = {}

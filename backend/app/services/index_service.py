@@ -66,13 +66,46 @@ def current_index(db: Session, booking_window: str | None) -> IndexResultOut:
     previous = db.scalars(select(IndexResult).where(IndexResult.booking_window == row.booking_window,
         IndexResult.observation_date < row.observation_date).order_by(desc(IndexResult.observation_date))).first()
     return _out(row, previous)
-
-
-def index_history(db: Session, start: date | None, end: date | None, booking_window: str | None) -> list[IndexResultOut]:
+def index_history(
+    db: Session,
+    start: date | None,
+    end: date | None,
+    booking_window: str | None,
+) -> list[IndexResultOut]:
     if start and end and start > end:
         raise HTTPException(422, "start date must not be after end date")
-    query = select(IndexResult).order_by(IndexResult.observation_date, IndexResult.calculation_timestamp)
-    if start: query = query.where(IndexResult.observation_date >= start)
-    if end: query = query.where(IndexResult.observation_date <= end)
-    if booking_window: query = query.where(IndexResult.booking_window == booking_window)
-    return [_out(row) for row in db.scalars(query).all()]
+
+    query = select(IndexResult)
+
+    if start:
+        query = query.where(IndexResult.observation_date >= start)
+
+    if end:
+        query = query.where(IndexResult.observation_date <= end)
+
+    if booking_window:
+        query = query.where(IndexResult.booking_window == booking_window)
+
+    rows = db.scalars(
+        query.order_by(
+            IndexResult.observation_date,
+            desc(IndexResult.calculation_timestamp),
+        )
+    ).all()
+
+    # A live pipeline may be rerun for the same observation date.
+    # Keep the latest calculation for each date/window in the history API.
+    latest_by_key: dict[tuple[date, str], IndexResult] = {}
+
+    for row in rows:
+        key = (row.observation_date, row.booking_window)
+        if key not in latest_by_key:
+            latest_by_key[key] = row
+
+    return [
+        _out(row)
+        for row in sorted(
+            latest_by_key.values(),
+            key=lambda item: (item.observation_date, item.booking_window),
+        )
+    ]
